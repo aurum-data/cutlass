@@ -1069,7 +1069,7 @@ def main():
     default_dataset_csv = HERE / "sample_data" / "leukemia_gene_expression.csv"
     if not default_dataset_csv.exists():
         default_dataset_csv = None
-    default_tr_fracs = [0.25]
+    default_tr_fracs = [0.75]
     default_Ks = [10.0]
     default_k_policies = ["global"]
     default_intercepts = ["mofk"]  # "mean","mofk","maxj"
