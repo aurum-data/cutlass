@@ -40,9 +40,9 @@ so experiment drivers can be migrated with minimal changes.
 - runs_*/ runs_csv*/ runs_new*/ runs_leuk/: experiment outputs (generated artifacts).
 
 ## Reference Papers (papers/)
-- 20250829_IEEE_Big_Data_Efficient_Longitudinal_Feature_Selection_via_Binarized_Transformation- Theory_and_Case_Studies_V5.pdf
-- 27_Paper_for_BDAA_2025.pdf
-- LASSO_Logic_Engine_20220819_IEEE-Big_Data.pdf
+- Orender, J., Zubair, M., & Sun, J. (2025). Efficient Longitudinal Feature Selection via Binarized Transformation: Theory and Case Studies. *2025 IEEE International Conference on Big Data (Big Data)*. (`20250829_IEEE_Big_Data_Efficient_Longitudinal_Feature_Selection_via_Binarized_Transformation- Theory_and_Case_Studies_V5.pdf`)
+- Orender, J., et al. (2025). [Paper for BDAA 2025]. *1st International Conference on Big Data Analytics & Applications (BDAA 2025)*. (`27_Paper_for_BDAA_2025.pdf`)
+- Orender, J., Zubair, M., & Sun, J. (2022). LASSO Logic Engine: Harnessing the logic parsing capabilities of the LASSO algorithm for longitudinal feature learning. *2022 IEEE International Conference on Big Data (Big Data)*. (`LASSO_Logic_Engine_20220819_IEEE-Big_Data.pdf`)
 
 ## Architecture & Design Principles
 - **Standalone Implementation**: CUTLASS avoids a scikit-learn dependency to maintain tight control over its specialized data transformations (critical range rectification) and optimization path (L1 coordinate descent). It closely mimics the `fit(X, y)` and `predict_proba(X)` API to stay intuitive.
