@@ -44,8 +44,18 @@ so experiment drivers can be migrated with minimal changes.
 - 27_Paper_for_BDAA_2025.pdf
 - LASSO_Logic_Engine_20220819_IEEE-Big_Data.pdf
 
-## Notes for Contributors
-- If you modify the modeling behavior, start in linear_model.py (CV + logical polish) and _solvers.py (optimization).
-- If you change how features are rectified or grouped, update preprocessing.py and review experiment drivers that
-  assume specific feature orders.
-- The experiment drivers mirror the papers and are the best integration tests; run them when making algorithmic changes.
+## Architecture & Design Principles
+- **Standalone Implementation**: CUTLASS avoids a scikit-learn dependency to maintain tight control over its specialized data transformations (critical range rectification) and optimization path (L1 coordinate descent). It closely mimics the `fit(X, y)` and `predict_proba(X)` API to stay intuitive.
+- **Performance**: Numeric helpers and solvers (in `_math.py` and `_solvers.py`) use heavily optimized NumPy operations.
+- **Dependencies**: Standard PEP 621 packaging (`pyproject.toml`). Base dependencies are strictly `numpy` and `pandas`, with `matplotlib` available as an optional `[plots]` extra.
+
+## Agent / Developer Modification Guide
+This section provides a direct mapping of developer intentions to files and concepts, allowing an AI agent or human to modify the codebase exactly where necessary:
+
+- **Modifying Optimization / Solvers**: To tweak coordinate descent or FISTA optimization steps, edit `src/cutlass/_solvers.py`.
+- **Modifying Logical Rules & Compression**: To alter how models are "polished" into logical rules or rounded to top-k elements, modify `src/cutlass/linear_model.py` (`CutlassLogisticCV`).
+- **Modifying Feature Binarization (Rectification)**: Changes to how critical ranges are computed from the positive class or how continuous variables are binarized must safely go in `src/cutlass/preprocessing.py` (`Rectifier`).
+- **Modifying Overall Pipeline / Wrappers**: To change arguments exposed to users or how the rectifier and model are chained together, look at `src/cutlass/model.py` (`CutlassClassifier`).
+- **Modifying Metrics / Validation**: New evaluators or changes to Youden's J, AUC, or other metrics should be done in `src/cutlass/metrics.py`.
+- **Validating Changes**: The experiment drivers (`experiment_driver_v5.py`, `experiment_driver_csv.py`) mirror the reference papers and serve as robust integration tests. Ensure they run successfully when making algorithmic changes.
+- **Build / Packaging**: The library uses standard tools (`python -m build`). Update `pyproject.toml` if modifying dependencies or metadata.
