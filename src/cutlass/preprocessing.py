@@ -10,6 +10,7 @@ This module contains
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence
 
 import numpy as np
@@ -123,6 +124,9 @@ class Rectifier:
     groups: Optional[Mapping[str, Sequence[str]]] = None
     sdfilter: Optional[float] = 3.0
     snap: float = 0.001
+    quantile_bounds: Optional[tuple[float, float]] = None
+    add_complements: bool = False
+    complement_prefix: str = "n"
     exclude_features: Sequence[str] = ()
 
     def fit(
@@ -157,19 +161,33 @@ class Rectifier:
                 Xpf = np.where(mask, X_pos, np.nan)
             else:
                 Xpf = X_pos
-            rmin = np.nanmin(Xpf, axis=0)
-            rmax = np.nanmax(Xpf, axis=0)
-            snap_count = max(1.0, float(self.snap) * float(n))
-            lower_counts = np.sum(X_mat < rmin, axis=0)
-            upper_counts = np.sum(X_mat > rmax, axis=0)
-            rmin = np.where(lower_counts < snap_count, np.nan, rmin)
-            rmax = np.where(upper_counts < snap_count, np.nan, rmax)
+            if self.quantile_bounds is not None:
+                qlo, qhi = self.quantile_bounds
+                if not (0.0 <= float(qlo) < float(qhi) <= 1.0):
+                    raise ValueError("quantile_bounds must satisfy 0 <= qlo < qhi <= 1.")
+                rmin = np.nanquantile(Xpf, float(qlo), axis=0)
+                rmax = np.nanquantile(Xpf, float(qhi), axis=0)
+            else:
+                rmin = np.nanmin(Xpf, axis=0)
+                rmax = np.nanmax(Xpf, axis=0)
 
+            if self.snap is not None and float(self.snap) > 0.0:
+                snap_count = max(1.0, math.floor(float(self.snap) * float(n)))
+                lower_counts = np.sum(X_mat < rmin, axis=0)
+                upper_counts = np.sum(X_mat > rmax, axis=0)
+                rmin = np.where(lower_counts < snap_count, np.nan, rmin)
+                rmax = np.where(upper_counts < snap_count, np.nan, rmax)
+
+        self.base_feature_names_ = list(features)
         self.feature_names_ = list(features)
+        if self.add_complements:
+            self.feature_names_.extend(
+                [f"{self.complement_prefix}{feat}" for feat in self.base_feature_names_]
+            )
         self.groups_ = {g: list(cols) for g, cols in groups.items()}
         self.rmin_ = rmin.astype(np.float64)
         self.rmax_ = rmax.astype(np.float64)
-        self.limits_ = _limits_from_training(self.feature_names_, self.groups_, self.rmin_, self.rmax_)
+        self.limits_ = _limits_from_training(self.base_feature_names_, self.groups_, self.rmin_, self.rmax_)
         return self
 
     def transform(
@@ -183,11 +201,12 @@ class Rectifier:
 
         X_df, feature_names = self._normalise_input(X, feature_names)
 
-        missing = [col for col in self.feature_names_ if col not in X_df.columns]
+        base_feature_names = getattr(self, "base_feature_names_", self.feature_names_)
+        missing = [col for col in base_feature_names if col not in X_df.columns]
         if missing:
             raise ValueError(f"Input is missing rectifier features: {missing}")
 
-        X_mat = X_df[self.feature_names_].to_numpy(dtype=np.float64, copy=False)
+        X_mat = X_df[base_feature_names].to_numpy(dtype=np.float64, copy=False)
 
         left_fail = np.zeros_like(X_mat, dtype=bool)
         right_fail = np.zeros_like(X_mat, dtype=bool)
@@ -198,6 +217,8 @@ class Rectifier:
         outside = left_fail | right_fail
 
         vec = np.where(outside, -1, 1).astype(np.int8)
+        if self.add_complements:
+            vec = np.hstack([vec, -vec])
         return vec
 
     def fit_transform(
@@ -228,4 +249,3 @@ class Rectifier:
             df = pd.DataFrame(np.asarray(X), columns=list(feature_names))
         feature_names = [col for col in df.columns if col not in exclude]
         return df, feature_names
-
