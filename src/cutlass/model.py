@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .linear_model import CutlassLogisticCV
-from .preprocessing import Rectifier, StandardScaler
+from .preprocessing import DuplicateColumnConsolidator, Rectifier, StandardScaler
 
 __all__ = ["CutlassClassifier"]
 
@@ -48,6 +48,8 @@ class CutlassClassifier:
     sdfilter: Optional[float] = 3.0
     snap: float = 0.001
     exclude_features: Sequence[str] = ()
+    duplicate_mode: str = "within_group"
+    duplicate_expansion: str = "split_evenly"
     use_scaler: Optional[bool] = None
     Cs: int | Sequence[float] = 15
     solver: str = "cd"
@@ -95,6 +97,15 @@ class CutlassClassifier:
         excludes = set(map(str, self.exclude_features))
         df = df[[col for col in df.columns if col not in excludes]]
 
+        if self.duplicate_mode not in {"none", "within_group", "global"}:
+            raise ValueError(
+                "duplicate_mode must be 'none', 'within_group', or 'global'."
+            )
+        if self.duplicate_expansion not in {"split_evenly", "representative_only"}:
+            raise ValueError(
+                "duplicate_expansion must be 'split_evenly' or 'representative_only'."
+            )
+
         if self.rectify:
             rectifier = Rectifier(
                 groups=self.groups,
@@ -110,19 +121,36 @@ class CutlassClassifier:
             X_rect = df.to_numpy(dtype=np.float64, copy=False)
             self.rectifier_ = None
 
+        consolidator = DuplicateColumnConsolidator(
+            mode=self.duplicate_mode,
+            expansion=self.duplicate_expansion,
+        )
+        X_fit = consolidator.fit_transform(X_rect, feature_names=feature_order)
+        fit_feature_order = list(consolidator.feature_names_)
+        self.duplicate_consolidator_ = consolidator
+        self.duplicate_report_ = {
+            "mode": consolidator.mode,
+            "expansion": consolidator.expansion,
+            "input_features": int(consolidator.n_input_features_),
+            "fit_features": int(consolidator.n_output_features_),
+            "duplicate_groups": int(consolidator.duplicate_group_count_),
+            "duplicate_cols_removed": int(consolidator.duplicate_cols_removed_),
+            "cross_group_alias_classes": int(consolidator.cross_group_alias_classes_),
+        }
+
         # Decide on scaling
         if self.use_scaler is None:
-            do_scale = not (self.rectify and _is_binary_pm1(X_rect))
+            do_scale = not (self.rectify and _is_binary_pm1(X_fit))
         else:
             do_scale = bool(self.use_scaler)
 
         if do_scale:
             scaler = StandardScaler(with_mean=True, with_std=True)
-            X_proc = scaler.fit_transform(X_rect)
+            X_proc = scaler.fit_transform(X_fit)
             self.scaler_ = scaler
         else:
             self.scaler_ = None
-            X_proc = np.asarray(X_rect, dtype=np.float64)
+            X_proc = np.asarray(X_fit, dtype=np.float64)
 
         lr = CutlassLogisticCV(
             Cs=self.Cs,
@@ -157,7 +185,8 @@ class CutlassClassifier:
         lr.fit(X_proc, y_arr)
 
         self.classifier_ = lr
-        self.feature_names_ = feature_order
+        self.feature_names_ = list(feature_order)
+        self.fit_feature_names_ = fit_feature_order
         self.classes_ = lr.classes_
         self.shape_ = X_proc.shape
         return self
@@ -182,9 +211,14 @@ class CutlassClassifier:
                 raise ValueError(f"Input is missing features: {missing}")
             X_rect = df[self.feature_names_].to_numpy(dtype=np.float64, copy=False)
 
+        X_fit = self.duplicate_consolidator_.transform(
+            X_rect,
+            feature_names=self.feature_names_,
+        )
+
         if self.scaler_ is not None:
-            return self.scaler_.transform(X_rect)
-        return np.asarray(X_rect, dtype=np.float64)
+            return self.scaler_.transform(X_fit)
+        return np.asarray(X_fit, dtype=np.float64)
 
     def predict_proba(
         self,
@@ -236,6 +270,8 @@ class CutlassClassifier:
             "sdfilter": self.sdfilter,
             "snap": self.snap,
             "exclude_features": self.exclude_features,
+            "duplicate_mode": self.duplicate_mode,
+            "duplicate_expansion": self.duplicate_expansion,
             "use_scaler": self.use_scaler,
             "Cs": self.Cs,
             "solver": self.solver,
@@ -276,3 +312,26 @@ class CutlassClassifier:
         if getattr(self, "rectifier_", None) is None:
             raise AttributeError("limits_ is only available when rectify=True.")
         return self.rectifier_.limits_
+
+    @property
+    def coef_fit_(self) -> np.ndarray:
+        """Coefficients on the deduplicated design matrix used during fitting."""
+        if not hasattr(self, "classifier_"):
+            raise AttributeError("coef_fit_ is only available after fit().")
+        return self.classifier_.coef_
+
+    @property
+    def coef_(self) -> np.ndarray:
+        """Coefficients expanded back to the original feature axis."""
+        if not hasattr(self, "classifier_"):
+            raise AttributeError("coef_ is only available after fit().")
+        expanded = self.duplicate_consolidator_.expand_coefficients(
+            self.classifier_.coef_.ravel()
+        )
+        return expanded.to_numpy(dtype=np.float64).reshape(1, -1)
+
+    @property
+    def intercept_(self) -> np.ndarray:
+        if not hasattr(self, "classifier_"):
+            raise AttributeError("intercept_ is only available after fit().")
+        return self.classifier_.intercept_

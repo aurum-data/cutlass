@@ -17,3 +17,4 @@ src/cutlass.egg-info/SOURCES.txt
 src/cutlass.egg-info/dependency_links.txt
 src/cutlass.egg-info/requires.txt
 src/cutlass.egg-info/top_level.txt
+tests/test_cd_pm1_refresh.py

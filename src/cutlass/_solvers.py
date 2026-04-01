@@ -97,6 +97,10 @@ class _CDLogistic:
             diag_h[diag_h <= 1e-12] = 1e-12
 
         for it in range(1, self.max_iter + 1):
+            if all_pm1:
+                mean_h = max(float(np.mean(wght)), 1e-12)
+                diag_h.fill(mean_h)
+
             order = sorted(active_set) if active_set else []
             if len(order) != p:
                 order.extend(int(i) for i in full_cycle if i not in active_set)
@@ -116,7 +120,10 @@ class _CDLogistic:
                     z += dw * X[:, j]
                     p_hat = _sigmoid(z)
                     wght = p_hat * (1 - p_hat)
-                    if not all_pm1:
+                    if all_pm1:
+                        mean_h = max(float(np.mean(wght)), 1e-12)
+                        diag_h.fill(mean_h)
+                    else:
                         diag_h[j] = np.mean((X[:, j] ** 2) * wght)
                         diag_h[j] = max(diag_h[j], 1e-12)
                 w[j] = w_j
@@ -125,6 +132,11 @@ class _CDLogistic:
             grad_b = np.mean(p_hat - y)
             b -= grad_b
             z -= grad_b
+            p_hat = _sigmoid(z)
+            wght = p_hat * (1 - p_hat)
+            if all_pm1:
+                mean_h = max(float(np.mean(wght)), 1e-12)
+                diag_h.fill(mean_h)
 
             grad = (X.T @ (p_hat - y)) / max(float(n), 1.0)
             inactive = [j for j in range(p) if j not in active_set]

@@ -16,7 +16,7 @@ from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequ
 import numpy as np
 import pandas as pd
 
-__all__ = ["StandardScaler", "Rectifier"]
+__all__ = ["DuplicateColumnConsolidator", "StandardScaler", "Rectifier"]
 
 
 class StandardScaler:
@@ -52,6 +52,174 @@ class StandardScaler:
 
     def fit_transform(self, X: np.ndarray, y: Optional[np.ndarray] = None) -> np.ndarray:
         return self.fit(X, y).transform(X)
+
+
+def _root_feature_group(feature_name: str) -> str:
+    """Return the coarse feature block used by duplicate consolidation."""
+    name = str(feature_name)
+    return name.split("_", 1)[0] if "_" in name else name
+
+
+@dataclass
+class DuplicateColumnConsolidator:
+    """
+    Collapse exact duplicate columns before fitting and expand coefficients back
+    onto the original feature axis after fitting.
+    """
+
+    mode: str = "within_group"
+    expansion: str = "split_evenly"
+
+    def fit(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        *,
+        feature_names: Optional[Sequence[str]] = None,
+    ) -> "DuplicateColumnConsolidator":
+        X_arr, names = self._normalise_input(X, feature_names)
+
+        if self.mode not in {"none", "within_group", "global"}:
+            raise ValueError("mode must be 'none', 'within_group', or 'global'.")
+        if self.expansion not in {"split_evenly", "representative_only"}:
+            raise ValueError("expansion must be 'split_evenly' or 'representative_only'.")
+
+        self.input_feature_names_ = list(names)
+        self.n_input_features_ = int(len(self.input_feature_names_))
+
+        global_buckets: dict[bytes, list[str]] = {}
+        global_groups: dict[bytes, set[str]] = {}
+        for idx, feature_name in enumerate(self.input_feature_names_):
+            key = self._column_key(X_arr[:, idx])
+            global_buckets.setdefault(key, []).append(feature_name)
+            global_groups.setdefault(key, set()).add(_root_feature_group(feature_name))
+
+        self.global_duplicate_classes_ = [
+            members for members in global_buckets.values() if len(members) > 1
+        ]
+        self.cross_group_alias_classes_ = int(
+            sum(
+                1
+                for key, members in global_buckets.items()
+                if len(members) > 1 and len(global_groups[key]) > 1
+            )
+        )
+
+        if self.mode == "none":
+            classes = [[name] for name in self.input_feature_names_]
+            rep_indices = np.arange(self.n_input_features_, dtype=int)
+        else:
+            buckets: dict[object, list[str]] = {}
+            rep_indices_by_key: dict[object, int] = {}
+            ordered_keys: list[object] = []
+
+            for idx, feature_name in enumerate(self.input_feature_names_):
+                key = self._column_key(X_arr[:, idx])
+                bucket_key: object
+                if self.mode == "global":
+                    bucket_key = key
+                else:
+                    bucket_key = (_root_feature_group(feature_name), key)
+                if bucket_key not in buckets:
+                    ordered_keys.append(bucket_key)
+                    buckets[bucket_key] = []
+                    rep_indices_by_key[bucket_key] = idx
+                buckets[bucket_key].append(feature_name)
+
+            classes = [buckets[key] for key in ordered_keys]
+            rep_indices = np.array(
+                [rep_indices_by_key[key] for key in ordered_keys],
+                dtype=int,
+            )
+
+        self.duplicate_classes_ = classes
+        self.rep_indices_ = rep_indices
+        self.feature_names_ = [members[0] for members in self.duplicate_classes_]
+        self.rep_to_members_ = {
+            members[0]: list(members) for members in self.duplicate_classes_
+        }
+        self.member_to_rep_ = {
+            member: representative
+            for representative, members in self.rep_to_members_.items()
+            for member in members
+        }
+        self.duplicate_group_count_ = int(
+            sum(1 for members in self.duplicate_classes_ if len(members) > 1)
+        )
+        self.n_output_features_ = int(len(self.feature_names_))
+        self.duplicate_cols_removed_ = int(
+            self.n_input_features_ - self.n_output_features_
+        )
+        return self
+
+    def transform(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        *,
+        feature_names: Optional[Sequence[str]] = None,
+    ) -> np.ndarray:
+        if not hasattr(self, "rep_indices_"):
+            raise RuntimeError(
+                "DuplicateColumnConsolidator must be fitted before calling transform()."
+            )
+        X_arr, names = self._normalise_input(X, feature_names)
+        if list(names) != self.input_feature_names_:
+            raise ValueError(
+                "Input feature names do not match the fitted duplicate consolidator order."
+            )
+        return np.asarray(X_arr)[:, self.rep_indices_]
+
+    def fit_transform(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        *,
+        feature_names: Optional[Sequence[str]] = None,
+    ) -> np.ndarray:
+        return self.fit(X, feature_names=feature_names).transform(
+            X,
+            feature_names=feature_names,
+        )
+
+    def expand_coefficients(
+        self,
+        coef: pd.Series | np.ndarray,
+        *,
+        expansion: Optional[str] = None,
+    ) -> pd.Series:
+        if isinstance(coef, pd.Series):
+            coef_reduced = coef.reindex(self.feature_names_).fillna(0.0)
+        else:
+            coef_arr = np.asarray(coef, dtype=np.float64).ravel()
+            if coef_arr.shape[0] != len(self.feature_names_):
+                raise ValueError(
+                    "Coefficient vector length does not match consolidated feature count."
+                )
+            coef_reduced = pd.Series(coef_arr, index=self.feature_names_, name="coef")
+
+        active_expansion = self.expansion if expansion is None else str(expansion)
+        expanded = pd.Series(0.0, index=self.input_feature_names_, name="coef")
+        for representative, members in self.rep_to_members_.items():
+            value = float(coef_reduced.get(representative, 0.0))
+            if active_expansion == "split_evenly" and members:
+                value /= float(len(members))
+            elif active_expansion != "representative_only":
+                raise ValueError("Unsupported coefficient expansion policy.")
+            for member in members:
+                expanded.loc[member] = value
+        return expanded
+
+    def _column_key(self, column: np.ndarray) -> bytes:
+        return np.ascontiguousarray(column).tobytes()
+
+    def _normalise_input(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        feature_names: Optional[Sequence[str]],
+    ) -> tuple[np.ndarray, list[str]]:
+        if isinstance(X, pd.DataFrame):
+            return X.to_numpy(copy=False), [str(col) for col in X.columns]
+        if feature_names is None:
+            raise ValueError("feature_names must be provided when X is not a DataFrame.")
+        return np.asarray(X), [str(col) for col in feature_names]
 
 
 def _organise_by_prefix(feature_names: Sequence[str]) -> Dict[str, List[str]]:

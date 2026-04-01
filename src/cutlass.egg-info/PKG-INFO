@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: cutlass
-Version: 0.1.0
+Version: 0.2.0
 Summary: Rectified L1 logistic regression with CUTLASS critical range encoding.
 Author-email: Jason Orender <joren001@odu.edu>
 License: MIT
