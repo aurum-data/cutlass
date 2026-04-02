@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from cutlass import CutlassClassifier, DuplicateColumnConsolidator
+from cutlass.linear_model import CutlassLogisticCV
 
 
 def test_duplicate_column_consolidator_modes_and_expansion() -> None:
@@ -89,3 +90,98 @@ def test_cutlass_classifier_deduplicates_and_expands_evenly() -> None:
     proba = clf.predict_proba(X)
     assert proba.shape == (len(X), 2)
     assert np.isfinite(proba).all()
+
+
+def test_cutlass_classifier_logic_polish_defaults_to_expanded_axis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signal = np.array([1, 1, 1, -1, -1, -1, 1, -1], dtype=np.float64)
+    noise = np.array([-1, 1, -1, 1, -1, 1, -1, 1], dtype=np.float64)
+    X = pd.DataFrame(
+        {
+            "P1_S_1": signal,
+            "P1_S_2": signal,
+            "P2_N_1": noise,
+            "P2_N_2": noise,
+        }
+    )
+    y = (signal == 1).astype(int)
+
+    calls: list[int] = []
+
+    def fake_logical_polish(self, X, y, w, b, **kwargs):
+        calls.append(int(X.shape[1]))
+        w_new = np.zeros_like(w, dtype=np.float64)
+        b_new = 0.0
+        return w_new, b_new, 1.0, True, [], {"called_on_p": int(X.shape[1])}
+
+    monkeypatch.setattr(CutlassLogisticCV, "_logical_polish", fake_logical_polish)
+
+    clf = CutlassClassifier(
+        rectify=False,
+        use_scaler=False,
+        Cs=[10.0],
+        cv=2,
+        solver="cd",
+        tol=1e-5,
+        max_iter=2000,
+        logic_polish=True,
+        verbose=False,
+    )
+    clf.fit(X, y)
+
+    assert clf.logic_polish_stage == "expanded"
+    assert calls == [4]
+    assert clf.coef_fit_.shape == (1, 2)
+    assert clf.coef_.shape == (1, 4)
+    assert np.allclose(clf.coef_, 0.0)
+    assert clf.logic_diag_["stage"] == "expanded"
+
+    proba = clf.predict_proba(X)
+    assert np.allclose(proba[:, 1], 0.5)
+    assert np.allclose(proba[:, 0], 0.5)
+
+
+def test_cutlass_classifier_can_still_logic_polish_on_fit_axis(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signal = np.array([1, 1, 1, -1, -1, -1, 1, -1], dtype=np.float64)
+    noise = np.array([-1, 1, -1, 1, -1, 1, -1, 1], dtype=np.float64)
+    X = pd.DataFrame(
+        {
+            "P1_S_1": signal,
+            "P1_S_2": signal,
+            "P2_N_1": noise,
+            "P2_N_2": noise,
+        }
+    )
+    y = (signal == 1).astype(int)
+
+    calls: list[int] = []
+
+    def fake_logical_polish(self, X, y, w, b, **kwargs):
+        calls.append(int(X.shape[1]))
+        w_new = np.zeros_like(w, dtype=np.float64)
+        b_new = 0.0
+        return w_new, b_new, 1.0, True, [], {"called_on_p": int(X.shape[1])}
+
+    monkeypatch.setattr(CutlassLogisticCV, "_logical_polish", fake_logical_polish)
+
+    clf = CutlassClassifier(
+        rectify=False,
+        use_scaler=False,
+        Cs=[10.0],
+        cv=2,
+        solver="cd",
+        tol=1e-5,
+        max_iter=2000,
+        logic_polish=True,
+        logic_polish_stage="fit",
+        verbose=False,
+    )
+    clf.fit(X, y)
+
+    assert calls == [2]
+    assert clf.logic_diag_["stage"] == "fit"
+    assert np.allclose(clf.coef_fit_, 0.0)
+    assert np.allclose(clf.coef_, 0.0)
