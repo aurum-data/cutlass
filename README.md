@@ -5,7 +5,8 @@ project scripts into a reusable, publishable Python library.  It exposes a
 scikit-learn inspired estimator that rectifies the input space into
 \{-1, +1\} indicators, trains an L1-penalised logistic model with an efficient
 coordinate-descent solver, and optionally compresses the model into a logical
-rule without any dependence on scikit-learn itself.
+rule without any dependence on scikit-learn itself. Version 0.5.0 adds an
+optional adaptive-L1 mode while preserving the default 0.4.0 L1 workflow.
 
 ## Features
 
@@ -13,6 +14,9 @@ rule without any dependence on scikit-learn itself.
   and binarises features into \{-1, +1\}.
 - **Cross-validated L1 logistic model** with warm-started coordinate descent
   and optional FISTA solver.
+- **Adaptive-L1 mode** (`penalty="adaptive_l1"`) that fits an L2 logistic pilot,
+  reweights the L1 penalty by `abs(beta_pilot) + adaptive_eps`, and maps
+  coefficients back to the original feature scale.
 - **Logical compression** step mirroring the research code (top-k votes with
   fixed magnitude `K` and several intercept policies).
 - **Serialization helpers** to persist rectifier limits and fitted models.
@@ -63,6 +67,21 @@ print(clf.predict_proba(X))
 print("limits:", clf.limits_)
 ```
 
+The default penalty remains standard L1. To use the adaptive-L1 mode, pass the
+optional penalty argument:
+
+```python
+adaptive_clf = CutlassClassifier(
+    rectify=True,
+    Cs=15,
+    solver="cd",
+    cv=3,
+    penalty="adaptive_l1",
+    adaptive_eps=1e-3,
+)
+adaptive_clf.fit(X, y)
+```
+
 ## Vignettes
 
 Additional step-by-step guides live under `docs/vignettes/`:
@@ -74,9 +93,11 @@ Additional step-by-step guides live under `docs/vignettes/`:
 ## API highlights
 
 - `cutlass.Rectifier`: transformer implementing the critical-range binarisation.
-- `cutlass.CutlassLogisticCV`: lower-level L1 logistic with cross-validation.
+- `cutlass.CutlassLogisticCV`: lower-level L1 or adaptive-L1 logistic with
+  cross-validation.
 - `cutlass.CutlassClassifier`: full workflow composed of the rectifier,
-  optional scaling, and the logistic path solver.
+  optional scaling, and the logistic path solver. Use `penalty="l1"` for the
+  default behavior or `penalty="adaptive_l1"` for the adaptive mode.
 - `cutlass.serialization`: helpers for saving rectifier limits and fitted
   weights.
 
@@ -91,6 +112,12 @@ To build the package locally:
 ```bash
 python -m build
 ```
+
+To update the project on PyPI, first bump `version` in `pyproject.toml`,
+commit the release changes, and create a clean source/wheel build with
+`python -m build`.  After confirming the files under `dist/` are correct,
+upload them with `python -m twine upload dist/*` using an account or API token
+that has permission to publish the `cutlass` package.
 
 Run the unit tests (if any) with:
 

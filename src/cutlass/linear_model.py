@@ -8,7 +8,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from ._math import _binary_log_loss_from_logits, _sigmoid
-from ._solvers import _CDLogistic, _FISTALogistic
+from ._solvers import _CDLogistic, _FISTALogistic, _RidgeLogistic
 from .metrics import calculate_youden_j
 
 
@@ -76,19 +76,124 @@ def _fold_path_worker_shm(args):
         shmX.close()
         shmy.close()
 
+
+def _fit_adaptive_pilot(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    pilot_C: float,
+    eps: float,
+    tol: float,
+    max_iter: int,
+):
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=int)
+    if pilot_C <= 0.0:
+        raise ValueError("adaptive_pilot_C must be positive.")
+    if eps <= 0.0:
+        raise ValueError("adaptive_eps must be positive.")
+
+    n = X.shape[0]
+    lam = 1.0 / (float(pilot_C) * max(float(n), 1.0))
+    pilot = _RidgeLogistic(lam=lam, tol=tol, max_iter=max_iter, verbose=False)
+    pilot.fit(X, y)
+    feature_scales = np.maximum(np.abs(pilot.w_) + float(eps), float(eps))
+    return feature_scales, pilot
+
+
+def _adaptive_fold_path_worker_shm(args):
+    """
+    Run one adaptive-L1 fold across the full C path.
+
+    Each fold gets its own L2 pilot fit, then the L1 path is fit on
+    X * (abs(beta_pilot) + eps). The returned validation losses are computed
+    on the same fold-specific weighted representation.
+    """
+    (shm_name_X, shape_X, dtype_X, order_X,
+     shm_name_y, shape_y, dtype_y,
+     val_idx, Cs_path, solver_name, tol, max_iter,
+     adaptive_eps, adaptive_pilot_C) = args
+
+    shmX = shared_memory.SharedMemory(name=shm_name_X)
+    X = np.ndarray(shape_X, dtype=np.dtype(dtype_X), buffer=shmX.buf, order=order_X)
+    shmy = shared_memory.SharedMemory(name=shm_name_y)
+    y = np.ndarray(shape_y, dtype=np.dtype(dtype_y), buffer=shmy.buf)
+
+    try:
+        n, p = X.shape
+        mask = np.ones(n, dtype=bool)
+        mask[val_idx] = False
+        Xtr, ytr = X[mask, :], y[mask]
+        Xva, yva = X[val_idx, :], y[val_idx]
+        ntr = Xtr.shape[0]
+
+        feature_scales, _ = _fit_adaptive_pilot(
+            Xtr,
+            ytr,
+            pilot_C=float(adaptive_pilot_C),
+            eps=float(adaptive_eps),
+            tol=float(tol),
+            max_iter=int(max_iter),
+        )
+        Xtr_weighted = np.asarray(Xtr * feature_scales[None, :], dtype=np.float64)
+        Xva_weighted = np.asarray(Xva * feature_scales[None, :], dtype=np.float64)
+
+        w_ws = np.zeros(p, dtype=np.float64)
+        b_ws = None
+        active_ws = np.array([], dtype=np.int32)
+
+        val_losses = np.empty(len(Cs_path), dtype=np.float64)
+        prev_C = None
+
+        for t, Ci in enumerate(Cs_path):
+            lam_ci = 1.0 / (float(Ci) * float(ntr))
+            lam_prev = (1.0 / (float(prev_C) * float(ntr))) if prev_C is not None else None
+
+            if solver_name in ("saga", "liblinear", "cd"):
+                solver = _CDLogistic(lam=lam_ci, tol=tol, max_iter=max_iter,
+                                     verbose=False, kkt_tol=1e-4, all_pm1=False)
+                solver.fit(
+                    Xtr_weighted,
+                    ytr,
+                    w0=w_ws,
+                    b0=b_ws,
+                    lam_prev=lam_prev,
+                    active_init=active_ws,
+                )
+            else:
+                solver = _FISTALogistic(lam=lam_ci, tol=tol, max_iter=max(max_iter, 4000), verbose=False)
+                solver.fit(Xtr_weighted, ytr, w0=w_ws, b0=b_ws)
+
+            z_val = Xva_weighted @ solver.w_ + solver.b_
+            val_losses[t] = _binary_log_loss_from_logits(yva.astype(float), z_val)
+
+            w_ws = solver.w_
+            b_ws = solver.b_
+            active_ws = np.where(np.abs(w_ws) > 0)[0].astype(np.int32)
+            prev_C = Ci
+
+        return val_losses
+    finally:
+        shmX.close()
+        shmy.close()
+
+
 class CutlassLogisticCV:
     """
     Minimal drop-in to replace sklearn.linear_model.CutlassLogisticCV (binary, L1).
+    Adaptive L1 is available as an optional mode via ``penalty="adaptive_l1"``.
 
     Supported args:
       - Cs (int or array-like): if int, uses np.logspace(-4, 4, Cs)
-      - penalty='l1'
+      - penalty='l1' (default) or 'adaptive_l1'
       - solver: 'cd' (recommended), or 'fista'; 'saga'/'liblinear' map to 'cd'
       - scoring='neg_log_loss' (only)
       - cv (int folds), tol, max_iter, random_state
       - refit (bool)
       - cv_rule: 'min' (best mean) or '1se' (strongest within one SE of best)
       - zero_clamp: set |w|<=threshold to 0 after final fit (cleanup only)
+      - adaptive_eps: stabilizer for adaptive-L1 weights, abs(beta_pilot) + eps
+      - adaptive_pilot_C: C value for the L2 pilot used by adaptive L1
 
     Attributes: coef_, intercept_, C_, Cs_, classes_
     
@@ -148,7 +253,10 @@ class CutlassLogisticCV:
                  # NEW: intercept policy
                  logic_intercept="mean",     # "mean" | "mofk" | "maxj"
                  logic_m=None,               # for "mofk": integer m (default: m=k)
-                 logic_m_frac=None):         # alternatively, fraction in (0,1]; m=ceil(frac*k)
+                 logic_m_frac=None,          # alternatively, fraction in (0,1]; m=ceil(frac*k)
+                 # adaptive-L1 knobs
+                 adaptive_eps=1e-3,
+                 adaptive_pilot_C=1.0):
         self.Cs = Cs
         self.penalty = penalty
         self.solver = solver
@@ -185,6 +293,8 @@ class CutlassLogisticCV:
         self.logic_intercept = str(logic_intercept).lower()  # "mean" | "mofk" | "maxj"
         self.logic_m         = None if logic_m is None else int(logic_m)
         self.logic_m_frac    = None if logic_m_frac is None else float(logic_m_frac)
+        self.adaptive_eps = float(adaptive_eps)
+        self.adaptive_pilot_C = float(adaptive_pilot_C)
     
         # learned attributes
         self.classes_   = np.array([0, 1], dtype=int)
@@ -196,6 +306,11 @@ class CutlassLogisticCV:
         # diagnostics from the logical step (populated if run)
         self.logic_diag_  = {}
         self.logic_figs_  = []
+        self.adaptive_feature_scales_ = None
+        self.adaptive_penalty_weights_ = None
+        self.adaptive_pilot_coef_ = None
+        self.adaptive_pilot_intercept_ = None
+        self.adaptive_weighted_coef_ = None
 
 
     def _kfold_indices(self, n):
@@ -543,10 +658,22 @@ class CutlassLogisticCV:
             Cs = np.asarray(self.Cs, dtype=np.float64)
         self.Cs_ = Cs.copy()
     
-        if self.penalty.lower() != "l1":
-            raise ValueError("Only penalty='l1' is supported.")
+        penalty = self.penalty.lower()
+        if penalty not in {"l1", "adaptive_l1"}:
+            raise ValueError("Only penalty='l1' and penalty='adaptive_l1' are supported.")
         if self.scoring not in ("neg_log_loss",):
             raise ValueError("Only scoring='neg_log_loss' is supported.")
+        if penalty == "adaptive_l1":
+            if self.adaptive_eps <= 0.0:
+                raise ValueError("adaptive_eps must be positive.")
+            if self.adaptive_pilot_C <= 0.0:
+                raise ValueError("adaptive_pilot_C must be positive.")
+
+        self.adaptive_feature_scales_ = None
+        self.adaptive_penalty_weights_ = None
+        self.adaptive_pilot_coef_ = None
+        self.adaptive_pilot_intercept_ = None
+        self.adaptive_weighted_coef_ = None
     
         folds = self._kfold_indices(n)  # list of validation indices
         all_pm1 = np.all((X == 1) | (X == -1))
@@ -579,20 +706,31 @@ class CutlassLogisticCV:
             # Prepare arguments: **one task per fold**
             args_list = []
             for f, val_idx in enumerate(folds):
-                args_list.append((
-                    shmX.name, X.shape, X.dtype.str, 'F',
-                    shmy.name, y.shape, y.dtype.str,
-                    val_idx.astype(np.int64, copy=False),
-                    Cs_path, solver_name, float(self.tol), int(self.max_iter), bool(all_pm1)
-                ))
+                if penalty == "adaptive_l1":
+                    args_list.append((
+                        shmX.name, X.shape, X.dtype.str, 'F',
+                        shmy.name, y.shape, y.dtype.str,
+                        val_idx.astype(np.int64, copy=False),
+                        Cs_path, solver_name, float(self.tol), int(self.max_iter),
+                        float(self.adaptive_eps), float(self.adaptive_pilot_C)
+                    ))
+                else:
+                    args_list.append((
+                        shmX.name, X.shape, X.dtype.str, 'F',
+                        shmy.name, y.shape, y.dtype.str,
+                        val_idx.astype(np.int64, copy=False),
+                        Cs_path, solver_name, float(self.tol), int(self.max_iter), bool(all_pm1)
+                    ))
     
             # Launch ONCE; each worker walks the entire path for its fold
             if self.cv == 1 or max_workers == 1:
                 # trivial sequential fallback (no pool)
-                fold_losses = [ _fold_path_worker_shm(a) for a in args_list ]
+                worker = _adaptive_fold_path_worker_shm if penalty == "adaptive_l1" else _fold_path_worker_shm
+                fold_losses = [ worker(a) for a in args_list ]
             else:
+                worker = _adaptive_fold_path_worker_shm if penalty == "adaptive_l1" else _fold_path_worker_shm
                 with ProcessPoolExecutor(max_workers=max_workers) as ex:
-                    fold_losses = list(ex.map(_fold_path_worker_shm, args_list))
+                    fold_losses = list(ex.map(worker, args_list))
     
             # Aggregate CV stats across folds for each C on the path
             fold_losses = np.vstack(fold_losses)              # (cv, nC)
@@ -623,20 +761,40 @@ class CutlassLogisticCV:
     
             # ----- Final refit on ALL data -----
             lam_final = 1.0 / (float(self.C_) * float(n))
+            X_refit = X
+            feature_scales = None
+            if penalty == "adaptive_l1":
+                feature_scales, pilot = _fit_adaptive_pilot(
+                    X,
+                    y,
+                    pilot_C=float(self.adaptive_pilot_C),
+                    eps=float(self.adaptive_eps),
+                    tol=float(self.tol),
+                    max_iter=int(self.max_iter),
+                )
+                X_refit = np.asarray(X * feature_scales[None, :], dtype=np.float64, order='F')
+                self.adaptive_feature_scales_ = feature_scales.copy()
+                self.adaptive_penalty_weights_ = (1.0 / feature_scales).copy()
+                self.adaptive_pilot_coef_ = pilot.w_.reshape(1, -1).copy()
+                self.adaptive_pilot_intercept_ = np.array([pilot.b_], dtype=np.float64)
+
             if use_hybrid:
                 # CD for the final refit to get crisp sparsity
-                all_pm1_full = np.all((X == 1) | (X == -1))
+                all_pm1_full = penalty == "l1" and np.all((X_refit == 1) | (X_refit == -1))
                 solver = _CDLogistic(lam=lam_final, tol=self.tol, max_iter=self.max_iter,
                                      verbose=self.verbose, kkt_tol=1e-4, all_pm1=all_pm1_full)
-                solver.fit(X, y, w0=None, b0=None, lam_prev=None, active_init=None)
+                solver.fit(X_refit, y, w0=None, b0=None, lam_prev=None, active_init=None)
             else:
-                solver = self._make_solver(lam_final, X)
+                solver = self._make_solver(lam_final, X_refit)
                 if isinstance(solver, _FISTALogistic):
-                    solver.fit(X, y, w0=None, b0=None)
+                    solver.fit(X_refit, y, w0=None, b0=None)
                 else:
-                    solver.fit(X, y, w0=None, b0=None, lam_prev=None, active_init=None)
+                    solver.fit(X_refit, y, w0=None, b0=None, lam_prev=None, active_init=None)
     
             w_final = solver.w_.copy()
+            if feature_scales is not None:
+                self.adaptive_weighted_coef_ = w_final.reshape(1, -1).copy()
+                w_final = w_final * feature_scales
             b_final = float(solver.b_)
     
             # Optional presentation clamp

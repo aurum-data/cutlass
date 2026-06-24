@@ -52,6 +52,8 @@ class CutlassClassifier:
     """
     End-to-end classifier that (optionally) performs CUTLASS rectification
     followed by an L1-penalised logistic model with cross-validation.
+    Set ``penalty="adaptive_l1"`` to use an L2 pilot fit to reweight the
+    L1 penalty while leaving the default ``penalty="l1"`` behavior unchanged.
 
     Parameters mirror the research scripts so the estimator can be used as a
     drop-in replacement inside scikit-learn workflows (fit / predict / score).
@@ -90,6 +92,9 @@ class CutlassClassifier:
     logic_m: Optional[int] = None
     logic_m_frac: Optional[float] = None
     verbose: bool = True
+    penalty: str = "l1"
+    adaptive_eps: float = 1e-3
+    adaptive_pilot_C: float = 1.0
 
     # ------------------------------------------------------------------ #
     # Fitting / prediction API
@@ -174,7 +179,7 @@ class CutlassClassifier:
         )
         lr = CutlassLogisticCV(
             Cs=self.Cs,
-            penalty="l1",
+            penalty=self.penalty,
             solver=self.solver,
             scoring="neg_log_loss",
             cv=self.cv,
@@ -201,6 +206,8 @@ class CutlassClassifier:
             logic_intercept=self.logic_intercept,
             logic_m=self.logic_m,
             logic_m_frac=self.logic_m_frac,
+            adaptive_eps=self.adaptive_eps,
+            adaptive_pilot_C=self.adaptive_pilot_C,
         )
         lr.fit(X_proc, y_arr)
 
@@ -404,6 +411,9 @@ class CutlassClassifier:
             "logic_m": self.logic_m,
             "logic_m_frac": self.logic_m_frac,
             "verbose": self.verbose,
+            "penalty": self.penalty,
+            "adaptive_eps": self.adaptive_eps,
+            "adaptive_pilot_C": self.adaptive_pilot_C,
         }
 
     def set_params(self, **params) -> "CutlassClassifier":

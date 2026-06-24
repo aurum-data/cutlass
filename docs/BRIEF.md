@@ -2,7 +2,7 @@
 
 ## Purpose
 CUTLASS (Critical-range rectified LASSO) is a lightweight Python package that implements the research workflow for
-rectified L1-penalized logistic regression and optional rule compression. It targets interpretable, sparse binary
+rectified L1-penalized logistic regression, optional adaptive-L1 reweighting, and optional rule compression. It targets interpretable, sparse binary
 classifiers by (1) rectifying numeric features into {-1, +1} indicators using class-conditional critical ranges,
 (2) fitting an L1 logistic model with cross-validation, and (3) optionally "polishing" the model into a fixed-magnitude
 logical rule optimized for Youden's J.
@@ -13,14 +13,16 @@ so experiment drivers can be migrated with minimal changes.
 ## Core Workflow (High Level)
 - Rectify: infer per-feature critical ranges from the positive class, then binarize features into {-1, +1}.
 - Scale: optionally standardize features when not already binary.
-- Fit: cross-validate an L1 logistic model across a C grid with warm starts and parallelized folds.
+- Fit: cross-validate an L1 logistic model across a C grid with warm starts and parallelized folds. The default is
+  standard L1; version 0.5.0 adds `penalty="adaptive_l1"`, which fits an L2 pilot model, reweights the L1 design by
+  `abs(beta_pilot) + adaptive_eps`, and maps final coefficients back to the original feature axis.
 - Polish (optional): compress to a top-k rule with fixed magnitude K and intercept policies, adopting if Youden's J
   stays within a user-defined tolerance.
 
 ## Package Structure (src/cutlass)
 - __init__.py: package exports (CutlassClassifier, CutlassLogisticCV, Rectifier, StandardScaler, metrics).
 - model.py: CutlassClassifier end-to-end estimator; handles rectification, scaling, fitting, and predictions.
-- linear_model.py: CutlassLogisticCV (L1 logistic CV, parallel fold evaluation, optional logical polish).
+- linear_model.py: CutlassLogisticCV (L1/adaptive-L1 logistic CV, parallel fold evaluation, optional logical polish).
 - _solvers.py: low-level solvers (_CDLogistic coordinate descent, _FISTALogistic proximal gradient).
 - preprocessing.py: Rectifier and a minimal StandardScaler; grouping heuristic by feature name prefix.
 - metrics.py: Youden's J, ROC AUC, and precision-recall curve implementations.
@@ -45,17 +47,17 @@ so experiment drivers can be migrated with minimal changes.
 - Orender, J., Zubair, M., & Sun, J. (2022). LASSO Logic Engine: Harnessing the logic parsing capabilities of the LASSO algorithm for longitudinal feature learning. *2022 IEEE International Conference on Big Data (Big Data)*. (`LASSO_Logic_Engine_20220819_IEEE-Big_Data.pdf`)
 
 ## Architecture & Design Principles
-- **Standalone Implementation**: CUTLASS avoids a scikit-learn dependency to maintain tight control over its specialized data transformations (critical range rectification) and optimization path (L1 coordinate descent). It closely mimics the `fit(X, y)` and `predict_proba(X)` API to stay intuitive.
+- **Standalone Implementation**: CUTLASS avoids a scikit-learn dependency to maintain tight control over its specialized data transformations (critical range rectification) and optimization path (L1 coordinate descent, with an internal L2 pilot for adaptive L1). It closely mimics the `fit(X, y)` and `predict_proba(X)` API to stay intuitive.
 - **Performance**: Numeric helpers and solvers (in `_math.py` and `_solvers.py`) use heavily optimized NumPy operations.
 - **Dependencies**: Standard PEP 621 packaging (`pyproject.toml`). Base dependencies are strictly `numpy` and `pandas`, with `matplotlib` available as an optional `[plots]` extra.
 
 ## Agent / Developer Modification Guide
 This section provides a direct mapping of developer intentions to files and concepts, allowing an AI agent or human to modify the codebase exactly where necessary:
 
-- **Modifying Optimization / Solvers**: To tweak coordinate descent or FISTA optimization steps, edit `src/cutlass/_solvers.py`.
+- **Modifying Optimization / Solvers**: To tweak coordinate descent, FISTA, or the adaptive-L1 L2 pilot optimization steps, edit `src/cutlass/_solvers.py`.
 - **Modifying Logical Rules & Compression**: To alter how models are "polished" into logical rules or rounded to top-k elements, modify `src/cutlass/linear_model.py` (`CutlassLogisticCV`).
 - **Modifying Feature Binarization (Rectification)**: Changes to how critical ranges are computed from the positive class or how continuous variables are binarized must safely go in `src/cutlass/preprocessing.py` (`Rectifier`).
-- **Modifying Overall Pipeline / Wrappers**: To change arguments exposed to users or how the rectifier and model are chained together, look at `src/cutlass/model.py` (`CutlassClassifier`).
+- **Modifying Overall Pipeline / Wrappers**: To change arguments exposed to users or how the rectifier and model are chained together, look at `src/cutlass/model.py` (`CutlassClassifier`). The adaptive mode is exposed as `CutlassClassifier(penalty="adaptive_l1")`; omitting `penalty` preserves the standard L1 behavior used in version 0.4.0.
 - **Modifying Metrics / Validation**: New evaluators or changes to Youden's J, AUC, or other metrics should be done in `src/cutlass/metrics.py`.
 - **Validating Changes**: The experiment drivers (`experiment_driver_v5.py`, `experiment_driver_csv.py`) mirror the reference papers and serve as robust integration tests. Ensure they run successfully when making algorithmic changes.
 - **Build / Packaging**: The library uses standard tools (`python -m build`). Update `pyproject.toml` if modifying dependencies or metadata.

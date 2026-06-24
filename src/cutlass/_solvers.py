@@ -17,7 +17,7 @@ from ._math import (
     _soft_threshold,
 )
 
-__all__ = ["_CDLogistic", "_FISTALogistic"]
+__all__ = ["_CDLogistic", "_FISTALogistic", "_RidgeLogistic"]
 
 
 class _CDLogistic:
@@ -278,6 +278,118 @@ class _FISTALogistic:
                 t = 1.0
                 w_y, b_y = w, b
             prev_obj = obj
+
+        self.w_ = w
+        self.b_ = b
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if self.w_ is None:
+            raise RuntimeError("Model must be fitted before calling predict_proba().")
+        z = X @ self.w_ + self.b_
+        p = _sigmoid(z)
+        return np.column_stack([1.0 - p, p])
+
+
+class _RidgeLogistic:
+    """Smooth L2-penalized logistic regression used as an adaptive-L1 pilot."""
+
+    def __init__(
+        self,
+        lam: float = 1.0,
+        tol: float = 1e-4,
+        max_iter: int = 2000,
+        verbose: bool = False,
+    ) -> None:
+        self.lam = float(lam)
+        self.tol = float(tol)
+        self.max_iter = int(max_iter)
+        self.verbose = bool(verbose)
+        self.w_: Optional[np.ndarray] = None
+        self.b_: float = 0.0
+        self.n_iter_: int = 0
+
+    @staticmethod
+    def _estimate_L(X: np.ndarray, lam: float) -> float:
+        X = np.asarray(X, dtype=np.float64)
+        n, p = X.shape
+        v = np.random.default_rng(123).standard_normal(p)
+        norm = np.linalg.norm(v)
+        if norm == 0.0:
+            return 0.25 + float(lam)
+        v /= norm
+        for _ in range(12):
+            Xv = X @ v
+            v = X.T @ Xv
+            nv = np.linalg.norm(v)
+            if nv == 0.0:
+                break
+            v /= nv
+        smax_sq = np.linalg.norm(X @ v) ** 2
+        return 0.25 * smax_sq / max(n, 1) + 0.25 + float(lam)
+
+    def _objective(self, X: np.ndarray, y: np.ndarray, w: np.ndarray, b: float) -> float:
+        z = X @ w + b
+        return float(_binary_log_loss_from_logits(y, z) + 0.5 * self.lam * np.dot(w, w))
+
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        *,
+        w0: Optional[np.ndarray] = None,
+        b0: Optional[float] = None,
+    ) -> "_RidgeLogistic":
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64)
+
+        n, p = X.shape
+        w = np.zeros(p, dtype=np.float64) if w0 is None else w0.astype(np.float64).copy()
+
+        if b0 is None:
+            py = np.clip(np.mean(y), 1e-6, 1 - 1e-6)
+            b = float(np.log(py / (1 - py)))
+        else:
+            b = float(b0)
+
+        L = max(self._estimate_L(X, self.lam), 1e-12)
+        step = 0.9 / L
+        w_y = w.copy()
+        b_y = b
+        t = 1.0
+        prev_obj = self._objective(X, y, w, b)
+
+        for it in range(1, self.max_iter + 1):
+            z = X @ w_y + b_y
+            p_hat = _sigmoid(z)
+            grad_w = (X.T @ (p_hat - y)) / max(float(n), 1.0) + self.lam * w_y
+            grad_b = float(np.mean(p_hat - y))
+
+            w_new = w_y - step * grad_w
+            b_new = b_y - step * grad_b
+            obj_new = self._objective(X, y, w_new, b_new)
+
+            if obj_new > prev_obj + 1e-10:
+                w_y = w.copy()
+                b_y = b
+                t = 1.0
+                step *= 0.5
+                continue
+
+            t_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * t * t))
+            w_acc = w_new + ((t - 1.0) / t_new) * (w_new - w)
+            b_acc = b_new + ((t - 1.0) / t_new) * (b_new - b)
+
+            dw = np.linalg.norm(w_new - w)
+            db = abs(b_new - b)
+            w, b = w_new, b_new
+            w_y, b_y = w_acc, b_acc
+            t = t_new
+            prev_obj = obj_new
+            self.n_iter_ = it
+
+            if dw + db <= self.tol * (1.0 + np.linalg.norm(w) + abs(b)):
+                break
 
         self.w_ = w
         self.b_ = b
