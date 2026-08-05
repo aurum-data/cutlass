@@ -1,7 +1,7 @@
 # Vignette 1: Rectified L1 Logistic Workflow
 
-This vignette mirrors the “rectify → fit → evaluate” path in the original
-experiment scripts using the new `cutlass` package.  We start with a tabular
+This vignette demonstrates the CPU reference “rectify → fit → evaluate” path in
+CUTLASS 0.6. We start with a tabular
 data frame, apply the built‑in rectifier that learns critical ranges from the
 positive class, and fit a cross‑validated L1 logistic model.
 
@@ -36,6 +36,7 @@ clf = CutlassClassifier(
     rectify=True,
     Cs=21,
     solver="cd",
+    backend="cpu",
     cv=5,
     logic_polish=False,  # keep plain L1 model for now
 )
@@ -49,6 +50,8 @@ print("ROC AUC:", roc_auc_score(df["INDC"], prob))
 print("Youden J:", calculate_youden_j(df["INDC"], pred))
 print("Selected features:", np.flatnonzero(clf.classifier_.coef_))
 print("Rectifier limits:", clf.limits_)
+print("Backend:", clf.backend_used_)
+print("Phase timings:", clf.fit_timings_)
 ```
 
 Key points:
@@ -57,3 +60,5 @@ Key points:
 - Rectification happens internally and the learned limits are exposed via
   `clf.limits_` for deployment or inspection.
 - Metrics such as Youden’s J and ROC AUC come from `cutlass.metrics`.
+- Coordinate descent (`solver="cd"`) is CPU-only. For CUDA FISTA or hybrid
+  fitting, continue with the [GPU backend vignette](04_gpu_backend.md).

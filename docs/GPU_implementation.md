@@ -2,8 +2,9 @@
 
 ## Purpose
 
-This document defines a package-level GPU execution mode for CUTLASS. The design
-supports SignalForge's Progressive Parameter Search while remaining suitable for
+This document records the package-level GPU execution mode delivered in CUTLASS
+0.6.0 and the remaining roadmap. The design supports SignalForge's Progressive
+Parameter Search while remaining suitable for
 notebooks, batch research, services, command-line tools, and other applications
 that use `CutlassLogisticCV` or `CutlassClassifier`.
 
@@ -25,16 +26,38 @@ The implementation must preserve:
 - a structured, observable CPU fallback rather than a silent change of backend;
 - a lightweight base installation with no mandatory CUDA dependency.
 
+## Implementation status
+
+The first milestone described here is implemented for CUTLASS 0.6.0. It includes
+lazy CUDA discovery, `cpu`/`cuda`/`auto` estimator backends, FP64 CuPy FISTA and
+adaptive ridge solvers, hybrid CPU coordinate-descent refitting, structured
+fallback and diagnostics, progress/cancellation hooks, serialization
+provenance, CUDA 12/13 extras, and CPU/GPU parity tests.
+
+Validation snapshot for the implementation environment: 21 tests pass in the
+`cutlass-gpu` environment; the CPU-only command reports 15 passed with 6
+CUDA-marked tests deselected. A source distribution and wheel also build
+successfully.
+Representative warm-process measurements put CPU ahead at 5,000 x 128 and CUDA
+slightly ahead at 20,000 x 512, which is why Auto mode uses a conservative
+work threshold rather than assuming every GPU fit will be faster.
+
+CUDA coordinate descent, concurrent fold streams, `fit_many`, GPU-native
+prediction outputs, and application-specific replay remain later work. The
+initial CUDA implementation evaluates folds sequentially in one process to
+prioritize numerical parity and safe device ownership.
+
 ## Executive decision
 
-Add `cpu`, `cuda`, and `auto` backends to the estimator APIs and implement CUDA
-with CuPy. Keep `backend="cpu"` as the initial default so upgrading CUTLASS does
-not change the numerical implementation used by existing research. Applications
+The estimator APIs expose `cpu`, `cuda`, and `auto` backends, with CUDA provided
+by CuPy. `backend="cpu"` remains the default so upgrading CUTLASS does not
+change the numerical implementation used by existing research. Applications
 that want automatic selection, including SignalForge, opt in with
 `backend="auto"`.
 
-Port FISTA and the adaptive-L1 ridge pilot first. Preserve the existing CPU
-coordinate-descent implementation. The initial CUDA release supports:
+The implementation ports FISTA and the adaptive-L1 ridge pilot while preserving
+the existing CPU coordinate-descent implementation. The initial CUDA release
+supports:
 
 | Solver | CPU backend | CUDA backend | Initial behavior |
 |---|---:|---:|---|
@@ -80,7 +103,9 @@ or global job queue.
 
 ## Current CUTLASS architecture
 
-The package is currently version 0.5.0 and depends only on NumPy and pandas.
+The pre-GPU baseline was version 0.5.0 and depended only on NumPy and pandas.
+Version 0.6.0 retains those base dependencies and adds CUDA only through
+explicit optional extras.
 Relevant files are:
 
 - [`linear_model.py`](../src/cutlass/linear_model.py):
@@ -94,9 +119,17 @@ Relevant files are:
   estimator construction, coefficient expansion, and prediction;
 - [`serialization.py`](../src/cutlass/serialization.py): backend-neutral NPZ
   persistence;
+- [`acceleration.py`](../src/cutlass/acceleration.py): public device discovery,
+  health status, and progress records;
+- [`_backend.py`](../src/cutlass/_backend.py),
+  [`_cuda_backend.py`](../src/cutlass/_cuda_backend.py), and
+  [`_cuda_solvers.py`](../src/cutlass/_cuda_solvers.py): capability checks,
+  lazy CuPy ownership, diagnostics, and CUDA FISTA/ridge solvers;
+- [`exceptions.py`](../src/cutlass/exceptions.py): public backend failures and
+  fallback warning;
 - [`pyproject.toml`](../pyproject.toml): required and optional dependencies.
 
-`CutlassLogisticCV.fit()` currently:
+The CPU path in `CutlassLogisticCV.fit()`:
 
 1. converts `X` to a float64 Fortran-order NumPy array and `y` to a NumPy array;
 2. creates deterministic folds with NumPy's seeded generator;
@@ -107,15 +140,14 @@ Relevant files are:
 7. refits on all data and optionally performs logical polish;
 8. returns NumPy coefficients, intercepts, and probabilities.
 
-The CUDA path must dispatch before CPU shared memory or a process pool is
-created. CUDA contexts must not be created independently in the existing fold
-workers.
+The CUDA path dispatches before CPU shared memory or a process pool is created.
+CUDA contexts are not created in the CPU fold workers.
 
 ## Public API contract
 
 ### Estimator parameters
 
-Add the same execution parameters to `CutlassLogisticCV` and
+The same execution parameters are available on `CutlassLogisticCV` and
 `CutlassClassifier`:
 
 ```python
@@ -141,8 +173,8 @@ Parameter semantics:
 - `backend="auto"` probes CUDA lazily and selects it only for a supported,
   sufficiently large workload. Choosing CPU during normal auto selection is not
   a fallback.
-- `device=None` means device 0 for an explicit CUDA request and the first healthy
-  eligible device for `auto`. An integer selects that exact device.
+- `device=None` means device 0 for either an explicit CUDA request or `auto`. An
+  integer selects that exact device.
 - `dtype="float64"` is the only parity-qualified CUDA precision in the first
   release. A later `float32` fast mode requires separate tests and must never be
   enabled implicitly.
@@ -226,29 +258,49 @@ An example report is:
     "requested": "auto",
     "used": "cuda",
     "provider": "cupy",
-    "decision_reason": "supported_batched_cv_work",
+    "decision": {
+        "selected": "cuda",
+        "reason": "supported_workload",
+        "estimated_work": 194400000,
+        "threshold": 75000000,
+        "estimated_device_bytes": 25000000,
+        "free_device_bytes": 18000000000,
+        "policy_version": 1,
+    },
     "fallback": None,
-    "device": {"id": 0, "name": "NVIDIA GeForce RTX 3090"},
+    "device": {
+        "id": 0,
+        "name": "NVIDIA GeForce RTX 3090",
+        "compute_capability": "8.6",
+    },
     "dtype": "float64",
     "shape": {"rows": 12000, "features": 180},
     "cv": 3,
     "c_values": 15,
+    "solver": "fista",
+    "penalty": "adaptive_l1",
+    "n_jobs_effective": 1,
+    "transfer_bytes": 17292000,
+    "synchronization_count": 42,
     "timings_seconds": {
-        "backend_resolution": 0.004,
         "host_to_device": 0.012,
         "adaptive_pilot": 0.083,
         "cv_path": 0.214,
         "device_to_host": 0.002,
+        "final_refit_gpu": 0.029,
         "final_refit": 0.031,
         "logical_polish_cpu": 0.0,
         "total": 0.351,
     },
     "peak_device_memory_bytes": 241172480,
+    "peak_reserved_device_memory_bytes": 268435456,
+    "runtime_versions": {"cupy": "14.x", "cuda_runtime": "13.x"},
 }
 ```
 
-Exact keys should be stabilized in tests before release. New diagnostic keys may
-be added in minor releases, but existing keys should not change meaning.
+These keys are covered by the backend and serialization tests. New diagnostic
+keys may be added in minor releases, but existing keys should not change
+meaning.
 
 ### Fallback visibility and exceptions
 
@@ -257,7 +309,7 @@ Fallback must not be silent. When an explicit CUDA request falls back, CUTLASS:
 1. emits a `CutlassBackendWarning` once for the fit;
 2. sets `backend_used_="cpu"`;
 3. stores a machine-readable code and safe message in `fallback_reason_`; and
-4. includes the failed phase and provider in `backend_report_`.
+4. includes the failed phase, code, and safe message in `backend_report_`.
 
 Define public exceptions in `cutlass.exceptions`:
 
@@ -284,24 +336,25 @@ model.fit(
 )
 ```
 
-`progress_callback` receives a JSON-compatible `FitProgress` object or dict with
-at least:
+`progress_callback` receives a JSON-compatible dictionary produced from
+`FitProgress`, with at least:
 
 ```text
 phase, completed, total, backend, fold, c_index, message, elapsed_seconds
 ```
 
 `cancel_callback` is a zero-argument callable returning a boolean. CUTLASS checks
-it at safe boundaries: before transfer, between fold paths, between C values,
-during long solver iterations at documented checkpoints, and before final
-refit. Callbacks run synchronously in the process and thread that called `fit()`.
-CUTLASS does not send HTTP events or inspect application queue objects.
+it at safe boundaries before transfer, between CUDA fold paths and C values,
+during CUDA solver iterations, and before final refit. CPU process-pool work is
+observed again when its fold jobs return. Callbacks run synchronously in the
+process and thread that called `fit()`. CUTLASS does not send HTTP events or
+inspect application queue objects.
 
-The CUDA path can report between C values because it remains in the calling
-process. The unchanged parallel CPU path may initially report only at fold
-boundaries; finer CPU progress would require a new parent/worker message
-protocol. A callback exception aborts the fit after cleanup and propagates to
-the caller. It is not a CUDA failure and must not trigger CPU fallback.
+The CUDA path reports between C values because it remains in the calling
+process. The parallel CPU path reports after the complete CV set returns; finer
+CPU progress would require a parent/worker message protocol. A callback
+exception aborts the fit after cleanup and propagates to the caller. It is not a
+CUDA failure and does not trigger CPU fallback.
 
 For SignalForge, the persistent CUDA worker translates queue cancellation state
 into `cancel_callback` and translates progress records into its NDJSON progress
@@ -316,12 +369,9 @@ The compatibility contract remains:
   are NumPy arrays;
 - a serialized fitted model can be loaded and used on a CPU-only machine.
 
-`CutlassLogisticCV` may additionally accept a CuPy or DLPack-compatible device
-array when `backend="cuda"`. Same-device, compatible-dtype input should avoid a
-host-to-device copy where practical, but zero-copy behavior is an optimization,
-not part of the correctness contract. The
-[CuPy interoperability guide](https://docs.cupy.dev/en/stable/user_guide/interoperability.html)
-documents DLPack exchange and stream-safety responsibilities.
+`CutlassLogisticCV` additionally accepts a CuPy array when `backend="cuda"`.
+Same-device, compatible-dtype input avoids the initial host-to-device copy.
+General DLPack ingestion is not part of the current public contract.
 `CutlassClassifier` continues to perform its pandas-oriented preprocessing on
 CPU in the first release.
 
@@ -366,7 +416,7 @@ operation may do so.
 
 ### File layout
 
-Add or refactor toward this layout:
+The implementation uses this layout:
 
 ```text
 src/cutlass/
@@ -387,20 +437,23 @@ place `import cupy` at module scope in `__init__.py`, `model.py`,
 
 ### Backend protocol
 
-The private backend adapter provides a small capability-oriented interface:
+The private CUDA adapter provides a small capability-oriented interface:
 
 ```text
 name
 provider
 device_id
-xp
+cp
 asarray(...)
 to_numpy(...)
+is_device_array(...)
 synchronize()
-event_timer()
+timed(...)
+timed_host(...)
 memory_info()
-pool_info()
-supports(solver, penalty, dtype)
+observe_memory()
+clear_unused()
+is_out_of_memory(...)
 ```
 
 Do not attempt a mechanical global replacement of `np` with `xp`. NumPy scalar
@@ -410,22 +463,21 @@ backtracking decisions, transfers, and event timing.
 
 ### Preserve the CPU reference path
 
-Refactor `CutlassLogisticCV.fit()` into a thin validator/dispatcher and two
-private paths:
+`CutlassLogisticCV.fit()` is a validator/dispatcher with two private execution
+paths:
 
 ```text
 fit()
   -> validate shared estimator semantics
   -> resolve backend and capabilities
-  -> _fit_cpu(...)   # current implementation moved with minimal changes
+  -> _run_cpu_backend(...) / _fit_cpu(...)  # NumPy reference path
   -> _fit_cuda(...)  # new implementation
   -> CPU logical polish when requested
   -> normalize public fitted attributes and diagnostics
 ```
 
-The first refactor commit should move the current implementation without
-changing numerical statements or process-pool behavior. Existing CPU tests and
-new golden fixtures must pass before CUDA code is introduced.
+The CPU path retains its shared-memory/process-pool behavior and remains
+independent of CuPy imports.
 
 ### CUDA FISTA
 
@@ -475,13 +527,16 @@ Each fold's C path is sequential because it relies on warm starts. Independent
 folds may run concurrently, but concurrency must be bounded by memory and
 benchmark results.
 
-Implement in stages:
+Status and later optimization stages:
 
-1. single CUDA stream, folds evaluated sequentially, for simplest parity;
-2. bounded streams for independent folds when this improves measured throughput;
-3. optional batched fold state for compatible shapes if streams remain
+1. **Implemented:** one calling-process CUDA context with folds evaluated
+   sequentially for parity and predictable ownership;
+2. **Future:** bounded streams for independent folds when measurements justify
+   the memory and complexity cost;
+3. **Future:** optional batched fold state for compatible shapes if streams remain
    underutilized;
-4. a general `fit_many` API only if multiple applications demonstrate a need.
+4. **Future:** a general `fit_many` API only if multiple applications demonstrate
+   a need.
 
 Transfer the full design matrix once per fit. Avoid materializing every fold's
 training matrix simultaneously when indexed views or bounded staging suffice.
@@ -527,16 +582,13 @@ estimated_work = base_work * adaptive_multiplier
 ```
 
 This estimate is an input to a calibrated decision, not a universal performance
-formula. The decision also considers:
+formula. The current decision also considers:
 
 - CUDA health and requested device;
 - solver/backend capability;
 - dtype support;
-- estimated free device memory after a safety margin;
-- host-to-device transfer bytes;
-- cold-context and kernel-compilation state where observable;
-- benchmark-derived crossover thresholds for the installed provider/device
-  class.
+- estimated device memory against an 80% free-memory safety margin;
+- the versioned, benchmark-informed work threshold.
 
 `auto` selects CPU when CUDA is unavailable, the solver is unsupported, memory
 is unsafe, or the fit is below the measured crossover. It selects CUDA only when
@@ -556,13 +608,15 @@ job and persists both the user-requested value (`auto`) and the resolved value.
 Passing `auto` independently to every small weekly fit would discard information
 known by the search planner and can underuse the GPU.
 
-Do not ship a hard-coded RTX 3090 threshold as a universal rule. Establish
-conservative defaults from a benchmark matrix, allow thresholds to evolve by
-package version, and record the threshold/version used for research provenance.
+Policy version 1 uses a device-independent default of 75,000,000 work units and
+an 80% free-memory preflight margin. `CUTLASS_CUDA_AUTO_MIN_WORK` can override
+the crossover for local benchmarking. The chosen threshold, estimate, memory
+estimate, and policy version are recorded in `auto_decision_`; the value is a
+conservative package policy, not a promise tied to a particular GPU model.
 
 ## Packaging and installation
 
-Keep the base package unchanged:
+The base package remains unchanged:
 
 ```bash
 pip install cutlass
@@ -578,18 +632,17 @@ cuda12 = ["cupy-cuda12x[ctk]>=14,<15"]
 cuda13 = ["cupy-cuda13x[ctk]>=14,<15"]
 ```
 
-The exact bounds must be confirmed in the release test matrix. Do not install
-more than one CuPy distribution in the same environment. CuPy publishes Windows
-and Linux wheels for CUDA 12 and CUDA 13, and its CUDA component-wheel option can
-provide the runtime pieces while still requiring a compatible NVIDIA driver.
+Do not install more than one CuPy distribution in the same environment. The
+`[ctk]` provider extra can install CUDA component wheels but still requires a
+compatible NVIDIA driver.
 See the [CuPy installation guide](https://docs.cupy.dev/en/stable/install.html).
 
 Example SignalForge environment setup for the observed CUDA 13-compatible
 workstation:
 
 ```powershell
-conda create --name sforge-gpu --clone sforge
-conda activate sforge-gpu
+conda create --name cutlass-gpu python=3.11
+conda activate cutlass-gpu
 python -m pip install "cutlass[cuda13]>=0.6,<0.7"
 python -c "from cutlass.acceleration import probe_backend; print(probe_backend('cuda', device=0).to_dict())"
 ```
@@ -601,13 +654,14 @@ release.
 
 ## Timing and memory diagnostics
 
-GPU operations are asynchronous. Use CUDA events around device work and
-synchronize the ending event before reporting elapsed GPU time. Use
-`perf_counter()` for caller-observed phases such as validation, import,
-transfers, CPU fallback, CPU final refit, and total wall time. Do not report an
-unsynchronized Python call duration as kernel time. CuPy's
+GPU operations are asynchronous. The current estimator reports synchronized
+wall-clock phase timings: observation boundaries synchronize the active stream,
+then use `perf_counter()` around transfers and model phases. These values are
+appropriate for application accounting but are not isolated kernel benchmarks.
+The private adapter also provides a CUDA-event timer for focused future
+profiling. CuPy's
 [performance guidance](https://docs.cupy.dev/en/stable/user_guide/performance.html)
-describes the required event and warm-up behavior.
+describes event timing and warm-up behavior.
 
 Record cold and warm timings separately in benchmarks because initial context
 creation and kernel compilation can dominate small fits. Report at least:
@@ -641,7 +695,7 @@ Handle failures at the whole-fit boundary:
 | Unsupported solver or dtype | Warn and restart CPU | `BackendConfigurationError` |
 | Memory preflight fails | Warn and restart CPU | `BackendExecutionError` |
 | CUDA out of memory | Synchronize, release references, clear unused pool blocks, restart CPU | `BackendExecutionError` |
-| CUDA runtime/kernel error | Release safe state and restart CPU only if the process remains healthy | `BackendExecutionError` |
+| CUDA runtime/kernel error | Release safe state, restart CPU, and report that a process restart is recommended | `BackendExecutionError` |
 | Cancellation | Raise `FitCancelledError` | Raise `FitCancelledError` |
 
 The package should not attempt to reset a corrupted CUDA context. It reports that
@@ -663,7 +717,7 @@ Fitted model state remains backend-neutral:
 - old NPZ files remain readable;
 - new files may add backend provenance without making it required for inference.
 
-Extend `save_classifier_npz()` with optional fields for requested/used backend,
+`save_classifier_npz()` stores optional fields for requested/used backend,
 provider, dtype, device description, provider/runtime versions, fallback code,
 and timing JSON. The existing loader can ignore unknown fields. If a richer
 model loader is later added, missing provenance in older artifacts means
@@ -752,6 +806,22 @@ This prevents trading-specific replay and queue behavior from leaking into the
 library.
 
 ## Test plan
+
+Current validation commands are:
+
+```powershell
+# Portable CPU contract; does not require CuPy.
+python -m pytest -m "not cuda"
+
+# Complete suite in the configured CUDA environment.
+conda run -n cutlass-gpu python -m pytest
+```
+
+The delivered suite covers CPU default/non-regression behavior, unavailable and
+unsupported backend decisions, Auto policy, progress and cancellation,
+serialization provenance, CUDA FISTA and hybrid parity, adaptive L1, device
+inputs, and callback failure propagation. The broader matrices below remain the
+recommended release-engineering and performance coverage as hardware permits.
 
 ### CPU non-regression
 
@@ -855,6 +925,21 @@ where CUDA is consistently slower.
 
 ## Implementation sequence
 
+Current status:
+
+| Phase | Status |
+| --- | --- |
+| 1. CPU instrumentation/reference | Delivered |
+| 2. Public contract and probing | Delivered |
+| 3. CUDA FISTA | Delivered; isolated kernel-event benchmarking remains optional profiling work |
+| 4. Adaptive L1 and hybrid refit | Delivered |
+| 5. Auto, resilience, callbacks | Delivered; broader device calibration remains ongoing |
+| 6. Packaging and documentation | Delivered locally; hosted GPU CI depends on release infrastructure |
+| 7. SignalForge integration | Outside this repository and still application work |
+
+The phase lists below are retained as an implementation and maintenance
+checklist.
+
 ### Phase 1: Instrument and freeze CPU behavior
 
 1. Add phase timings and expose current fold/C losses needed by parity tests.
@@ -880,7 +965,8 @@ claim model-fitting support.
 1. Add CuPy math helpers and `_CuPyFISTALogistic`.
 2. Match the CPU FISTA update, backtracking, restart, and stopping logic.
 3. Implement single-stream fold paths and warm starts.
-4. Add CUDA event timing, transfer counts, and memory reporting.
+4. Add synchronized phase timing, transfer counts, and memory reporting; retain
+   CUDA-event timing as a private profiling facility.
 5. Pass FP64 parity tests before optimizing streams or synchronization.
 
 ### Phase 4: Adaptive L1 and hybrid refit
@@ -920,7 +1006,12 @@ This phase supplies SignalForge's required CUTLASS model-fitting path.
 6. Decide from profiling whether CUTLASS needs a reusable `fit_many` API or
    whether SignalForge's bounded worker queue is sufficient.
 
-## Release acceptance criteria
+## Release acceptance and integration gates
+
+The package-local functional gates are exercised by the current test suite.
+Long-duration memory soak testing, a broad multi-device benchmark matrix, hosted
+GPU CI, and the SignalForge search/ranking integration remain environment- or
+application-level gates.
 
 GPU mode is ready for a stable release only when:
 
@@ -940,14 +1031,14 @@ GPU mode is ready for a stable release only when:
   cancellation, Apply semantics, and artifact provenance in its integration
   tests.
 
-## Recommended first milestone
+## Delivered first milestone
 
-The first CUTLASS milestone should deliver a parity-qualified, optional CUDA
+The CUTLASS 0.6 milestone delivers a parity-qualified, optional CUDA
 backend for `solver="fista"` and `solver="hybrid"`, including adaptive L1,
-diagnostics, health probing, fallback, progress, and cancellation. It should not
-attempt CUDA coordinate descent, application job queues, or trading replay.
+diagnostics, health probing, fallback, progress, and cancellation. It does not
+include CUDA coordinate descent, application job queues, or trading replay.
 
-That milestone is both useful beyond SignalForge and sufficient for SignalForge
+The milestone is useful beyond SignalForge and sufficient for SignalForge
 to integrate GPU model fitting into a single persistent worker. Profiling the
 integrated search then determines whether the next investment belongs in
 multi-fit batching, a specialized coordinate-descent kernel, or the
@@ -955,12 +1046,11 @@ application's replay optimizer.
 
 ## Final recommendation
 
-Proceed with a CuPy-backed CUDA implementation in CUTLASS, but expose it through
-hardware-oriented `cpu`, `cuda`, and `auto` contracts rather than
-SignalForge-specific settings. Preserve CPU as the default and scientific
-reference, implement FISTA and the adaptive ridge pilot natively on GPU, use the
-existing CPU coordinate descent for the hybrid final refit, and make every
-backend decision and fallback visible.
+The delivered CuPy backend uses hardware-oriented `cpu`, `cuda`, and `auto`
+contracts rather than SignalForge-specific settings. CPU remains the default
+and scientific reference; FISTA and the adaptive ridge pilot run natively on
+GPU; hybrid mode uses the existing CPU coordinate descent for its final refit;
+and backend decisions and fallbacks are visible.
 
 Keep the persistent worker and search batching in SignalForge. This gives
 SignalForge safe single-owner GPU execution while leaving CUTLASS usable as a

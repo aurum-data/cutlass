@@ -1,5 +1,11 @@
 numpy>=1.24
 pandas>=1.5
 
+[cuda12]
+cupy-cuda12x[ctk]<15,>=14
+
+[cuda13]
+cupy-cuda13x[ctk]<15,>=14
+
 [plots]
 matplotlib>=3.5

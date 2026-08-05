@@ -2,9 +2,14 @@ LICENSE
 README.md
 pyproject.toml
 src/cutlass/__init__.py
+src/cutlass/_backend.py
+src/cutlass/_cuda_backend.py
+src/cutlass/_cuda_solvers.py
 src/cutlass/_math.py
 src/cutlass/_solvers.py
 src/cutlass/_version.py
+src/cutlass/acceleration.py
+src/cutlass/exceptions.py
 src/cutlass/linear_model.py
 src/cutlass/metrics.py
 src/cutlass/model.py
@@ -18,5 +23,7 @@ src/cutlass.egg-info/dependency_links.txt
 src/cutlass.egg-info/requires.txt
 src/cutlass.egg-info/top_level.txt
 tests/test_adaptive_l1.py
+tests/test_backends.py
 tests/test_cd_pm1_refresh.py
 tests/test_duplicate_consolidation.py
+tests/test_gpu_parity.py

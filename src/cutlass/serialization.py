@@ -79,6 +79,22 @@ def save_classifier_npz(model: CutlassClassifier, feature_names: Sequence[str], 
     state["lr.penalty"] = np.array([lr.penalty], dtype=object)
     state["lr.cv_rule"] = np.array([lr.cv_rule], dtype=object)
     state["lr.zero_clamp"] = np.array([lr.zero_clamp], dtype=np.float64)
+    if getattr(lr, "backend_report_", None):
+        state["lr.backend_report_json"] = np.array(
+            [json.dumps(lr.backend_report_, sort_keys=True)], dtype=object
+        )
+    for attribute in (
+        "backend_requested_",
+        "backend_used_",
+        "backend_provider_",
+        "device_name_",
+        "dtype_",
+    ):
+        value = getattr(lr, attribute, None)
+        if value is not None:
+            state[f"lr.{attribute}"] = np.array([value], dtype=object)
+    if getattr(lr, "device_id_", None) is not None:
+        state["lr.device_id_"] = np.array([int(lr.device_id_)], dtype=np.int64)
 
     np.savez_compressed(path, **state)
 
@@ -107,4 +123,3 @@ def load_classifier_npz(path: str | Path) -> tuple[StandardScaler | None, np.nda
     intercept = blob["lr.intercept_"].astype(np.float64)
     classes = blob["lr.classes_"].astype(int)
     return scaler, coef, intercept, classes
-

@@ -1,12 +1,12 @@
 # Vignette 3: Batched Experiments and Artifact Export
 
-This vignette condenses the functionality of `experiment_driver_v5.py` into a
-few reusable helpers built on top of the packaged API.  It demonstrates how to
+This vignette builds a reproducible experiment runner on the packaged API. It
+demonstrates how to
 
 1. generate multiple train/test splits,
 2. evaluate alternative logic-polish targets and intercept policies,
 3. capture metrics and diagnostics in a tidy results table, and
-4. persist rectifier limits + fitted weights for deployment.
+4. persist rectifier limits, fitted weights, and execution provenance.
 
 ```python
 from __future__ import annotations
@@ -31,6 +31,9 @@ class ExperimentConfig:
     logic_k_policy: str
     logic_intercept: str
     logic_scale: float
+    solver: str = "cd"
+    backend: str = "cpu"
+    allow_cpu_fallback: bool = False
 
 
 def prepare_split(df: pd.DataFrame, resp: str, *, seed: int, frac: float):
@@ -50,7 +53,9 @@ def run_single_experiment(df: pd.DataFrame, resp: str, cfg: ExperimentConfig):
     clf = CutlassClassifier(
         rectify=True,
         Cs=21,
-        solver="cd",
+        solver=cfg.solver,
+        backend=cfg.backend,
+        allow_cpu_fallback=cfg.allow_cpu_fallback,
         cv=5,
         random_state=cfg.seed,
         logic_polish=True,
@@ -68,7 +73,7 @@ def run_single_experiment(df: pd.DataFrame, resp: str, cfg: ExperimentConfig):
     yhat_tr = (prob_tr >= 0.5).astype(int)
     yhat_te = (prob_te >= 0.5).astype(int)
 
-    diag = clf.classifier_.logic_diag_
+    diag = clf.logic_diag_
 
     metrics = {
         "seed": cfg.seed,
@@ -77,6 +82,10 @@ def run_single_experiment(df: pd.DataFrame, resp: str, cfg: ExperimentConfig):
         "logic_k_policy": cfg.logic_k_policy,
         "logic_intercept": cfg.logic_intercept,
         "logic_scale": cfg.logic_scale,
+        "backend_requested": clf.backend_requested_,
+        "backend_used": clf.backend_used_,
+        "fallback_reason": clf.fallback_reason_,
+        "fit_seconds": clf.fit_timings_["total"],
         "adopted": diag.get("adopted", False),
         "k_chosen": diag.get("k_chosen"),
         "J_train": calculate_youden_j(y_tr, yhat_tr),
@@ -88,6 +97,7 @@ def run_single_experiment(df: pd.DataFrame, resp: str, cfg: ExperimentConfig):
     artifacts = {
         "limits": clf.limits_,
         "logic_diag": diag,
+        "backend_report": clf.backend_report_,
     }
     return metrics, clf, artifacts
 
@@ -117,19 +127,27 @@ for i, cfg in enumerate(configs, start=1):
     run_dir = outdir / f"run_{i:02d}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Persist rectifier limits + L1 coefficients.
+    # The NPZ contains weights and a JSON-encoded backend report.
     save_limits_json(model.limits_, run_dir / "limits.json")
     save_classifier_npz(model, model.feature_names_, run_dir / "classifier.npz")
 
-    # Diagnostics collected during logic polishing.
-    (run_dir / "logic_diag.json").write_text(json.dumps(artifacts["logic_diag"], indent=2))
+    # Keep human-readable copies for experiment auditing.
+    (run_dir / "logic_diag.json").write_text(
+        json.dumps(artifacts["logic_diag"], indent=2), encoding="utf-8"
+    )
+    (run_dir / "backend_report.json").write_text(
+        json.dumps(artifacts["backend_report"], indent=2), encoding="utf-8"
+    )
 
 results = pd.DataFrame(rows)
 results.to_csv(outdir / "summary.csv", index=False)
 print(results)
 ```
 
-The helper pattern retains the modularity of the original experiment driver
-while depending solely on the published package.  You can expand on this by
-adding joblib-based parallelism, plotting hooks, or target grids just as in the
-prototype script.
+The helper keeps each result tied to the backend that actually produced it.
+CPU-only configurations can be distributed across worker processes. For CUDA,
+prefer one persistent process per GPU with a bounded queue, and run CUTLASS fits
+sequentially inside that process; do not create a fresh GPU process for every
+configuration. Set `solver="fista"` or `"hybrid"` and `backend="cuda"` only
+after `probe_backend("cuda")` succeeds, or use `backend="auto"` when per-fit
+selection is appropriate.

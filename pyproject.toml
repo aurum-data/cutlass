@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cutlass"
-version = "0.5.0"
+version = "0.6.0"
 description = "Rectified L1 logistic regression with CUTLASS critical range encoding."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -31,6 +31,8 @@ dependencies = [
 
 [project.optional-dependencies]
 plots = ["matplotlib>=3.5"]
+cuda12 = ["cupy-cuda12x[ctk]>=14,<15"]
+cuda13 = ["cupy-cuda13x[ctk]>=14,<15"]
 
 [project.urls]
 Homepage = "https://github.com/jworender/cutlass"
@@ -42,3 +44,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 cutlass = ["py.typed"]
+
+[tool.pytest.ini_options]
+markers = [
+  "cuda: requires a healthy CUDA device and the optional CuPy provider",
+]

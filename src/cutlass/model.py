@@ -6,7 +6,7 @@ scikit-learn-inspired API.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Mapping, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -54,6 +54,9 @@ class CutlassClassifier:
     followed by an L1-penalised logistic model with cross-validation.
     Set ``penalty="adaptive_l1"`` to use an L2 pilot fit to reweight the
     L1 penalty while leaving the default ``penalty="l1"`` behavior unchanged.
+    The ``backend`` parameter selects the CPU reference implementation, the
+    optional CuPy CUDA path, or automatic per-fit selection. CUDA execution is
+    available with ``solver="fista"`` and ``solver="hybrid"``.
 
     Parameters mirror the research scripts so the estimator can be used as a
     drop-in replacement inside scikit-learn workflows (fit / predict / score).
@@ -95,6 +98,10 @@ class CutlassClassifier:
     penalty: str = "l1"
     adaptive_eps: float = 1e-3
     adaptive_pilot_C: float = 1.0
+    backend: str = "cpu"
+    device: Optional[int] = None
+    dtype: str = "float64"
+    allow_cpu_fallback: bool = True
 
     # ------------------------------------------------------------------ #
     # Fitting / prediction API
@@ -106,6 +113,8 @@ class CutlassClassifier:
         y: Iterable[int] | np.ndarray,
         *,
         feature_names: Optional[Sequence[str]] = None,
+        progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+        cancel_callback: Optional[Callable[[], bool]] = None,
     ) -> "CutlassClassifier":
         df = _ensure_dataframe(X, feature_names)
         y_arr = np.asarray(y, dtype=int)
@@ -208,8 +217,17 @@ class CutlassClassifier:
             logic_m_frac=self.logic_m_frac,
             adaptive_eps=self.adaptive_eps,
             adaptive_pilot_C=self.adaptive_pilot_C,
+            backend=self.backend,
+            device=self.device,
+            dtype=self.dtype,
+            allow_cpu_fallback=self.allow_cpu_fallback,
         )
-        lr.fit(X_proc, y_arr)
+        lr.fit(
+            X_proc,
+            y_arr,
+            progress_callback=progress_callback,
+            cancel_callback=cancel_callback,
+        )
 
         self._coef_fit_ = np.asarray(lr.coef_, dtype=np.float64).reshape(1, -1)
         self._coef_full_override_ = None
@@ -217,6 +235,22 @@ class CutlassClassifier:
         self._predict_with_expanded_model_ = False
         self.logic_figs_ = list(getattr(lr, "logic_figs_", []))
         self.logic_diag_ = dict(getattr(lr, "logic_diag_", {}))
+        for attribute in (
+            "backend_requested_",
+            "backend_used_",
+            "backend_provider_",
+            "device_id_",
+            "device_name_",
+            "dtype_",
+            "n_jobs_effective_",
+            "fallback_reason_",
+            "auto_decision_",
+            "fit_timings_",
+            "peak_device_memory_bytes_",
+            "runtime_versions_",
+            "backend_report_",
+        ):
+            setattr(self, attribute, getattr(lr, attribute))
 
         if self.scaler_ is not None:
             self._scaler_mean_full_ = _expand_representative_values(
@@ -414,6 +448,10 @@ class CutlassClassifier:
             "penalty": self.penalty,
             "adaptive_eps": self.adaptive_eps,
             "adaptive_pilot_C": self.adaptive_pilot_C,
+            "backend": self.backend,
+            "device": self.device,
+            "dtype": self.dtype,
+            "allow_cpu_fallback": self.allow_cpu_fallback,
         }
 
     def set_params(self, **params) -> "CutlassClassifier":

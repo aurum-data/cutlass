@@ -2,14 +2,65 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from multiprocessing import Pool, shared_memory
-from typing import Iterable, List, Optional, Sequence, Tuple
+from time import perf_counter
+from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from ._backend import (
+    cuda_supports,
+    estimate_cuda_bytes,
+    estimate_work,
+    normalise_backend,
+    normalise_device,
+    normalise_dtype,
+)
 from ._math import _binary_log_loss_from_logits, _sigmoid
 from ._solvers import _CDLogistic, _FISTALogistic, _RidgeLogistic
+from .acceleration import FitProgress
+from .exceptions import (
+    BackendConfigurationError,
+    BackendExecutionError,
+    BackendUnavailableError,
+    CutlassBackendWarning,
+    FitCancelledError,
+)
 from .metrics import calculate_youden_j
+
+
+def _check_cancel(cancel_callback: Optional[Callable[[], bool]]) -> None:
+    if cancel_callback is not None and bool(cancel_callback()):
+        raise FitCancelledError("CUTLASS fit was cancelled.")
+
+
+def _emit_progress(
+    callback: Optional[Callable[[dict[str, Any]], None]],
+    *,
+    phase: str,
+    completed: int,
+    total: int,
+    backend: str,
+    started_at: float,
+    fold: Optional[int] = None,
+    c_index: Optional[int] = None,
+    message: str = "",
+) -> None:
+    if callback is None:
+        return
+    callback(
+        FitProgress(
+            phase=phase,
+            completed=int(completed),
+            total=int(total),
+            backend=backend,
+            fold=fold,
+            c_index=c_index,
+            message=message,
+            elapsed_seconds=max(0.0, perf_counter() - started_at),
+        ).to_dict()
+    )
 
 
 def _fold_path_worker_shm(args):
@@ -186,7 +237,8 @@ class CutlassLogisticCV:
     Supported args:
       - Cs (int or array-like): if int, uses np.logspace(-4, 4, Cs)
       - penalty='l1' (default) or 'adaptive_l1'
-      - solver: 'cd' (recommended), or 'fista'; 'saga'/'liblinear' map to 'cd'
+      - solver: 'cd' (recommended), 'fista', or 'hybrid';
+        'saga'/'liblinear' map to CPU coordinate descent
       - scoring='neg_log_loss' (only)
       - cv (int folds), tol, max_iter, random_state
       - refit (bool)
@@ -194,8 +246,17 @@ class CutlassLogisticCV:
       - zero_clamp: set |w|<=threshold to 0 after final fit (cleanup only)
       - adaptive_eps: stabilizer for adaptive-L1 weights, abs(beta_pilot) + eps
       - adaptive_pilot_C: C value for the L2 pilot used by adaptive L1
+      - backend: 'cpu' (default), 'cuda', or 'auto'
+      - device: optional zero-based CUDA device id
+      - dtype: 'float64' (the parity-qualified precision)
+      - allow_cpu_fallback: restart unsupported/failed CUDA fits on CPU
 
-    Attributes: coef_, intercept_, C_, Cs_, classes_
+    ``fista`` can run its CV path and final refit on CUDA. ``hybrid`` can run
+    FISTA CV on CUDA and performs its final coordinate-descent refit on CPU.
+    Logical polishing and public prediction remain CPU operations.
+
+    Attributes include coef_, intercept_, C_, Cs_, classes_, backend_report_,
+    fit_timings_, and backend selection/fallback diagnostics.
     
     Includes optional logical post-processing ("logical polish") after the final refit:
       - logic_polish: bool, off by default
@@ -256,7 +317,12 @@ class CutlassLogisticCV:
                  logic_m_frac=None,          # alternatively, fraction in (0,1]; m=ceil(frac*k)
                  # adaptive-L1 knobs
                  adaptive_eps=1e-3,
-                 adaptive_pilot_C=1.0):
+                 adaptive_pilot_C=1.0,
+                 # execution backend
+                 backend="cpu",
+                 device=None,
+                 dtype="float64",
+                 allow_cpu_fallback=True):
         self.Cs = Cs
         self.penalty = penalty
         self.solver = solver
@@ -295,6 +361,10 @@ class CutlassLogisticCV:
         self.logic_m_frac    = None if logic_m_frac is None else float(logic_m_frac)
         self.adaptive_eps = float(adaptive_eps)
         self.adaptive_pilot_C = float(adaptive_pilot_C)
+        self.backend = backend
+        self.device = device
+        self.dtype = dtype
+        self.allow_cpu_fallback = bool(allow_cpu_fallback)
     
         # learned attributes
         self.classes_   = np.array([0, 1], dtype=int)
@@ -311,6 +381,25 @@ class CutlassLogisticCV:
         self.adaptive_pilot_coef_ = None
         self.adaptive_pilot_intercept_ = None
         self.adaptive_weighted_coef_ = None
+        self.cv_fold_losses_ = None
+        self.cv_mean_losses_ = None
+        self.cv_se_losses_ = None
+        self.cv_path_Cs_ = None
+
+        # Populated after every successful fit.
+        self.backend_requested_ = None
+        self.backend_used_ = None
+        self.backend_provider_ = None
+        self.device_id_ = None
+        self.device_name_ = None
+        self.dtype_ = None
+        self.n_jobs_effective_ = None
+        self.fallback_reason_ = None
+        self.auto_decision_ = None
+        self.fit_timings_ = {}
+        self.peak_device_memory_bytes_ = None
+        self.runtime_versions_ = {}
+        self.backend_report_ = {}
 
 
     def _kfold_indices(self, n):
@@ -631,7 +720,15 @@ class CutlassLogisticCV:
 
 
 
-    def fit(self, X, y):
+    def _fit_cpu(
+        self,
+        X,
+        y,
+        *,
+        progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+        cancel_callback: Optional[Callable[[], bool]] = None,
+        started_at: Optional[float] = None,
+    ):
         """
         Cross-validated L1 logistic with **persistent** process pool:
           - one pool for the whole CV run,
@@ -645,6 +742,18 @@ class CutlassLogisticCV:
         import math
         from concurrent.futures import ProcessPoolExecutor
         from multiprocessing import shared_memory, cpu_count
+
+        cpu_method_started = perf_counter()
+        progress_started = cpu_method_started if started_at is None else started_at
+        _check_cancel(cancel_callback)
+        _emit_progress(
+            progress_callback,
+            phase="input_validation",
+            completed=0,
+            total=1,
+            backend="cpu",
+            started_at=progress_started,
+        )
     
         # Parent-side arrays (we keep X as Fortran for fast column slices in CD)
         X = np.asarray(X, dtype=np.float64, order='F')
@@ -674,6 +783,10 @@ class CutlassLogisticCV:
         self.adaptive_pilot_coef_ = None
         self.adaptive_pilot_intercept_ = None
         self.adaptive_weighted_coef_ = None
+        self._last_cpu_phase_timings = {
+            "input_validation": perf_counter() - cpu_method_started
+        }
+        cv_started = perf_counter()
     
         folds = self._kfold_indices(n)  # list of validation indices
         all_pm1 = np.all((X == 1) | (X == -1))
@@ -739,6 +852,21 @@ class CutlassLogisticCV:
                 se_losses = np.std(fold_losses, axis=0, ddof=1) / math.sqrt(self.cv)
             else:
                 se_losses = np.zeros_like(mean_losses)
+
+            self.cv_fold_losses_ = fold_losses.copy()
+            self.cv_mean_losses_ = mean_losses.copy()
+            self.cv_se_losses_ = se_losses.copy()
+            self.cv_path_Cs_ = Cs_path.copy()
+            _check_cancel(cancel_callback)
+            _emit_progress(
+                progress_callback,
+                phase="cv_path",
+                completed=int(self.cv),
+                total=int(self.cv),
+                backend="cpu",
+                started_at=progress_started,
+                message="CPU cross-validation paths completed.",
+            )
     
             # Emit a compact progress log (optional)
             if self.verbose:
@@ -758,8 +886,20 @@ class CutlassLogisticCV:
                 chosen_C = float(Cs_path[int(np.argmin(mean_losses))])
     
             self.C_ = chosen_C
+            self._last_cpu_phase_timings["cv_path"] = perf_counter() - cv_started
+
+            _check_cancel(cancel_callback)
+            _emit_progress(
+                progress_callback,
+                phase="final_refit",
+                completed=0,
+                total=1,
+                backend="cpu",
+                started_at=progress_started,
+            )
     
             # ----- Final refit on ALL data -----
+            final_refit_started = perf_counter()
             lam_final = 1.0 / (float(self.C_) * float(n))
             X_refit = X
             feature_scales = None
@@ -800,8 +940,12 @@ class CutlassLogisticCV:
             # Optional presentation clamp
             if self.zero_clamp > 0.0:
                 w_final[np.abs(w_final) <= self.zero_clamp] = 0.0
-    
+            self._last_cpu_phase_timings["final_refit"] = (
+                perf_counter() - final_refit_started
+            )
+
             # Optional logical polish (unchanged)
+            logical_started = perf_counter()
             if self.logic_polish:
                 w_new, b_new, j_new, adopted, figs, diag = self._logical_polish(
                     X=X, y=y, w=w_final, b=b_final,
@@ -820,9 +964,23 @@ class CutlassLogisticCV:
                     print(f"[logical] adopted rule-like model: J={j_new:.4f}")
                 if adopted:
                     w_final, b_final = w_new, b_new
+            self._last_cpu_phase_timings["logical_polish_cpu"] = (
+                perf_counter() - logical_started
+            )
     
             self.coef_ = w_final.reshape(1, -1)
             self.intercept_ = np.array([b_final], dtype=np.float64)
+            self._last_cpu_phase_timings["cpu_fit"] = (
+                perf_counter() - cpu_method_started
+            )
+            _emit_progress(
+                progress_callback,
+                phase="final_refit",
+                completed=1,
+                total=1,
+                backend="cpu",
+                started_at=progress_started,
+            )
             return self
     
         finally:
@@ -833,6 +991,812 @@ class CutlassLogisticCV:
                 shmX.unlink(); shmy.unlink()
             except Exception:
                 pass
+
+
+    def _c_count(self) -> int:
+        if isinstance(self.Cs, (int, np.integer)):
+            return int(self.Cs)
+        return int(np.asarray(self.Cs).size)
+
+
+    def _run_cpu_backend(
+        self,
+        X,
+        y,
+        *,
+        requested: str,
+        dtype_name: str,
+        fit_started: float,
+        fallback_reason: Optional[dict[str, Any]],
+        auto_decision: Optional[dict[str, Any]],
+        progress_callback: Optional[Callable[[dict[str, Any]], None]],
+        cancel_callback: Optional[Callable[[], bool]],
+    ):
+        cpu_started = perf_counter()
+        self._fit_cpu(
+            X,
+            y,
+            progress_callback=progress_callback,
+            cancel_callback=cancel_callback,
+            started_at=fit_started,
+        )
+        cpu_elapsed = perf_counter() - cpu_started
+        total_elapsed = perf_counter() - fit_started
+        if self.n_jobs in (None, -1):
+            effective_jobs = min(self.cv, max(1, (os.cpu_count() or 1) - 1))
+        else:
+            effective_jobs = min(self.cv, max(1, int(self.n_jobs)))
+
+        self.backend_requested_ = requested
+        self.backend_used_ = "cpu"
+        self.backend_provider_ = "numpy"
+        self.device_id_ = None
+        self.device_name_ = None
+        self.dtype_ = dtype_name
+        self.n_jobs_effective_ = effective_jobs
+        self.fallback_reason_ = fallback_reason
+        self.auto_decision_ = auto_decision
+        self.fit_timings_ = {
+            key: float(value)
+            for key, value in getattr(self, "_last_cpu_phase_timings", {}).items()
+        }
+        self.fit_timings_["cpu_fit"] = float(cpu_elapsed)
+        self.fit_timings_["total"] = float(total_elapsed)
+        self.peak_device_memory_bytes_ = None
+        self.runtime_versions_ = {"numpy": str(np.__version__)}
+        rows, features = np.shape(X)[:2]
+        self.backend_report_ = {
+            "requested": requested,
+            "used": "cpu",
+            "provider": "numpy",
+            "decision": auto_decision,
+            "fallback": fallback_reason,
+            "device": None,
+            "dtype": dtype_name,
+            "shape": {"rows": int(rows), "features": int(features)},
+            "cv": int(self.cv),
+            "c_values": self._c_count(),
+            "solver": str(self.solver).lower(),
+            "penalty": str(self.penalty).lower(),
+            "n_jobs_effective": int(effective_jobs),
+            "timings_seconds": dict(self.fit_timings_),
+            "peak_device_memory_bytes": None,
+            "runtime_versions": dict(self.runtime_versions_),
+        }
+        _emit_progress(
+            progress_callback,
+            phase="complete",
+            completed=1,
+            total=1,
+            backend="cpu",
+            started_at=fit_started,
+        )
+        return self
+
+
+    def _fit_cuda(
+        self,
+        X,
+        y,
+        *,
+        cuda_backend,
+        progress_callback: Optional[Callable[[dict[str, Any]], None]],
+        cancel_callback: Optional[Callable[[], bool]],
+        fit_started: float,
+    ) -> dict[str, Any]:
+        """Fit supported FISTA/hybrid configurations in one CUDA-owning process."""
+
+        from ._cuda_solvers import (
+            _CuPyFISTALogistic,
+            _CuPyRidgeLogistic,
+            cuda_binary_log_loss,
+        )
+
+        cp = cuda_backend.cp
+        timings: dict[str, float] = {}
+        transfer_bytes = 0
+        _check_cancel(cancel_callback)
+        _emit_progress(
+            progress_callback,
+            phase="host_to_device",
+            completed=0,
+            total=1,
+            backend="cuda",
+            started_at=fit_started,
+        )
+
+        if cuda_backend.is_device_array(X):
+            X_source = X
+        else:
+            X_source = np.asarray(X, dtype=np.float64, order="F")
+            transfer_bytes += int(X_source.nbytes)
+        if cuda_backend.is_device_array(y):
+            y_source = y
+        else:
+            y_source = np.asarray(y, dtype=int)
+            transfer_bytes += int(y_source.nbytes)
+
+        def transfer_inputs():
+            X_device = cuda_backend.asarray(X_source, dtype=cp.float64, order="F")
+            y_device = cuda_backend.asarray(y_source, dtype=cp.int64)
+            return X_device, y_device
+
+        (X_device, y_device), timings["host_to_device"] = cuda_backend.timed_host(
+            transfer_inputs
+        )
+        if X_device.ndim != 2 or y_device.ndim != 1:
+            raise ValueError("X must be 2D and y must be 1D.")
+        if X_device.shape[0] != y_device.shape[0]:
+            raise ValueError("X and y must have the same number of rows.")
+        n, p = map(int, X_device.shape)
+        y_device_float = y_device.astype(cp.float64)
+        _emit_progress(
+            progress_callback,
+            phase="host_to_device",
+            completed=1,
+            total=1,
+            backend="cuda",
+            started_at=fit_started,
+        )
+
+        if isinstance(self.Cs, (int, np.integer)):
+            Cs = np.logspace(-4, 4, int(self.Cs))
+        else:
+            Cs = np.asarray(self.Cs, dtype=np.float64)
+        self.Cs_ = Cs.copy()
+
+        penalty = str(self.penalty).lower()
+        if penalty not in {"l1", "adaptive_l1"}:
+            raise ValueError("Only penalty='l1' and penalty='adaptive_l1' are supported.")
+        if self.scoring != "neg_log_loss":
+            raise ValueError("Only scoring='neg_log_loss' is supported.")
+        if penalty == "adaptive_l1":
+            if self.adaptive_eps <= 0.0:
+                raise ValueError("adaptive_eps must be positive.")
+            if self.adaptive_pilot_C <= 0.0:
+                raise ValueError("adaptive_pilot_C must be positive.")
+
+        self.adaptive_feature_scales_ = None
+        self.adaptive_penalty_weights_ = None
+        self.adaptive_pilot_coef_ = None
+        self.adaptive_pilot_intercept_ = None
+        self.adaptive_weighted_coef_ = None
+
+        folds = self._kfold_indices(n)
+        lam_full = 1.0 / (np.maximum(Cs, 1e-12) * float(n))
+        order = np.argsort(lam_full)[::-1]
+        Cs_path = Cs[order]
+        total_paths = int(len(folds) * len(Cs_path))
+        fold_losses_host: list[np.ndarray] = []
+        pilot_elapsed = 0.0
+        cv_started = perf_counter()
+
+        for fold_index, val_idx in enumerate(folds):
+            _check_cancel(cancel_callback)
+            mask_host = np.ones(n, dtype=bool)
+            mask_host[val_idx] = False
+            mask = cuda_backend.asarray(mask_host, dtype=cp.bool_)
+            val_device = cuda_backend.asarray(
+                val_idx.astype(np.int64, copy=False), dtype=cp.int64
+            )
+            Xtr = X_device[mask, :]
+            ytr = y_device_float[mask]
+            Xva = X_device[val_device, :]
+            yva = y_device_float[val_device]
+            ntr = int(Xtr.shape[0])
+
+            if penalty == "adaptive_l1":
+                pilot_start = perf_counter()
+                pilot_lam = 1.0 / (
+                    float(self.adaptive_pilot_C) * max(float(ntr), 1.0)
+                )
+                pilot = _CuPyRidgeLogistic(
+                    cp,
+                    lam=pilot_lam,
+                    tol=self.tol,
+                    max_iter=self.max_iter,
+                    verbose=False,
+                )
+                pilot.fit(Xtr, ytr, cancel_callback=cancel_callback)
+                feature_scales = cp.maximum(
+                    cp.abs(pilot.w_) + float(self.adaptive_eps),
+                    float(self.adaptive_eps),
+                )
+                Xtr_fit = Xtr * feature_scales[None, :]
+                Xva_fit = Xva * feature_scales[None, :]
+                cuda_backend.synchronize()
+                pilot_elapsed += perf_counter() - pilot_start
+            else:
+                Xtr_fit = Xtr
+                Xva_fit = Xva
+
+            w_ws = cp.zeros(p, dtype=cp.float64)
+            b_ws = None
+            val_losses = np.empty(len(Cs_path), dtype=np.float64)
+            for c_index, Ci in enumerate(Cs_path):
+                _check_cancel(cancel_callback)
+                lam_ci = 1.0 / (float(Ci) * float(ntr))
+                solver = _CuPyFISTALogistic(
+                    cp,
+                    lam=lam_ci,
+                    tol=self.tol,
+                    max_iter=max(self.max_iter, 4000),
+                    verbose=False,
+                )
+                solver.fit(
+                    Xtr_fit,
+                    ytr,
+                    w0=w_ws,
+                    b0=b_ws,
+                    cancel_callback=cancel_callback,
+                )
+                z_val = Xva_fit @ solver.w_ + solver.b_
+                val_losses[c_index] = float(
+                    cuda_binary_log_loss(cp, yva, z_val).item()
+                )
+                w_ws = solver.w_
+                b_ws = solver.b_
+                completed = fold_index * len(Cs_path) + c_index + 1
+                _emit_progress(
+                    progress_callback,
+                    phase="cv_path",
+                    completed=completed,
+                    total=total_paths,
+                    backend="cuda",
+                    started_at=fit_started,
+                    fold=fold_index,
+                    c_index=c_index,
+                )
+            fold_losses_host.append(val_losses)
+            del mask, val_device, Xtr, ytr, Xva, yva, Xtr_fit, Xva_fit, w_ws, b_ws
+            cuda_backend.observe_memory()
+
+        cuda_backend.synchronize()
+        timings["cv_path"] = perf_counter() - cv_started
+        timings["adaptive_pilot"] = pilot_elapsed
+        fold_losses = np.vstack(fold_losses_host)
+        mean_losses = np.mean(fold_losses, axis=0)
+        if self.cv > 1:
+            se_losses = np.std(fold_losses, axis=0, ddof=1) / math.sqrt(self.cv)
+        else:
+            se_losses = np.zeros_like(mean_losses)
+        self.cv_fold_losses_ = fold_losses.copy()
+        self.cv_mean_losses_ = mean_losses.copy()
+        self.cv_se_losses_ = se_losses.copy()
+        self.cv_path_Cs_ = Cs_path.copy()
+
+        if self.verbose:
+            for i, Ci in enumerate(Cs_path):
+                lam_dbg = 1.0 / (float(Ci) * float(n))
+                print(
+                    f"[CV|cuda] C={Ci:.4g} (lam~={lam_dbg:.3e}) -> "
+                    f"mean={mean_losses[i]:.6f} +/- {se_losses[i]:.6f}"
+                )
+
+        selection_started = perf_counter()
+        if self.cv_rule.lower() == "1se":
+            j_best = int(np.argmin(mean_losses))
+            threshold = mean_losses[j_best] + se_losses[j_best]
+            candidates = np.where(mean_losses <= threshold)[0]
+            j_pick = int(np.min(candidates)) if candidates.size else j_best
+            self.C_ = float(Cs_path[j_pick])
+        else:
+            self.C_ = float(Cs_path[int(np.argmin(mean_losses))])
+        timings["cv_selection"] = perf_counter() - selection_started
+
+        _check_cancel(cancel_callback)
+        _emit_progress(
+            progress_callback,
+            phase="final_refit",
+            completed=0,
+            total=1,
+            backend="cuda",
+            started_at=fit_started,
+        )
+        final_started = perf_counter()
+        lam_final = 1.0 / (float(self.C_) * float(n))
+        X_refit = X_device
+        feature_scales = None
+        if penalty == "adaptive_l1":
+            pilot_lam = 1.0 / (
+                float(self.adaptive_pilot_C) * max(float(n), 1.0)
+            )
+            pilot = _CuPyRidgeLogistic(
+                cp,
+                lam=pilot_lam,
+                tol=self.tol,
+                max_iter=self.max_iter,
+                verbose=False,
+            )
+            pilot.fit(X_device, y_device_float, cancel_callback=cancel_callback)
+            feature_scales = cp.maximum(
+                cp.abs(pilot.w_) + float(self.adaptive_eps),
+                float(self.adaptive_eps),
+            )
+            X_refit = X_device * feature_scales[None, :]
+            self.adaptive_feature_scales_ = cuda_backend.to_numpy(feature_scales)
+            self.adaptive_penalty_weights_ = 1.0 / self.adaptive_feature_scales_
+            self.adaptive_pilot_coef_ = cuda_backend.to_numpy(pilot.w_).reshape(1, -1)
+            self.adaptive_pilot_intercept_ = np.array(
+                [float(pilot.b_.item())], dtype=np.float64
+            )
+
+        solver_name = str(self.solver).lower()
+        if solver_name == "hybrid":
+            transfer_started = perf_counter()
+            X_refit_host = cuda_backend.to_numpy(X_refit)
+            y_host = cuda_backend.to_numpy(y_device).astype(int, copy=False)
+            timings["device_to_host"] = perf_counter() - transfer_started
+            cpu_refit_started = perf_counter()
+            all_pm1 = penalty == "l1" and np.all(
+                (X_refit_host == 1) | (X_refit_host == -1)
+            )
+            final_solver = _CDLogistic(
+                lam=lam_final,
+                tol=self.tol,
+                max_iter=self.max_iter,
+                verbose=self.verbose,
+                kkt_tol=1e-4,
+                all_pm1=all_pm1,
+            )
+            final_solver.fit(
+                X_refit_host,
+                y_host,
+                w0=None,
+                b0=None,
+                lam_prev=None,
+                active_init=None,
+            )
+            w_final = final_solver.w_.copy()
+            b_final = float(final_solver.b_)
+            timings["final_refit_cpu"] = perf_counter() - cpu_refit_started
+        else:
+            gpu_refit_started = perf_counter()
+            final_solver = _CuPyFISTALogistic(
+                cp,
+                lam=lam_final,
+                tol=self.tol,
+                max_iter=max(self.max_iter, 4000),
+                verbose=self.verbose,
+            )
+            final_solver.fit(
+                X_refit,
+                y_device_float,
+                w0=None,
+                b0=None,
+                cancel_callback=cancel_callback,
+            )
+            cuda_backend.synchronize()
+            timings["final_refit_gpu"] = perf_counter() - gpu_refit_started
+            transfer_started = perf_counter()
+            w_final = cuda_backend.to_numpy(final_solver.w_)
+            b_final = float(final_solver.b_.item())
+            timings["device_to_host"] = perf_counter() - transfer_started
+
+        if feature_scales is not None:
+            self.adaptive_weighted_coef_ = w_final.reshape(1, -1).copy()
+            w_final = w_final * self.adaptive_feature_scales_
+        if self.zero_clamp > 0.0:
+            w_final[np.abs(w_final) <= self.zero_clamp] = 0.0
+        timings["final_refit"] = perf_counter() - final_started
+
+        logical_started = perf_counter()
+        if self.logic_polish:
+            if cuda_backend.is_device_array(X):
+                X_logical = cuda_backend.to_numpy(X_device)
+            else:
+                X_logical = np.asarray(X, dtype=np.float64)
+            y_logical = cuda_backend.to_numpy(y_device).astype(int, copy=False)
+            w_new, b_new, j_new, adopted, figs, diag = self._logical_polish(
+                X=X_logical,
+                y=y_logical,
+                w=w_final,
+                b=b_final,
+                K=self.logic_scale,
+                target=self.logic_target,
+                rel_tol=self.logic_rel_tol,
+                maxk=self.logic_maxk,
+                make_plots=self.logic_plot,
+                Ks_plot=self.logic_Ks_plot,
+                plot_dir=self.logic_plot_dir,
+                verbose=self.verbose,
+            )
+            self.logic_figs_ = figs
+            self.logic_diag_ = diag
+            if adopted:
+                w_final, b_final = w_new, b_new
+                if self.verbose:
+                    print(f"[logical] adopted rule-like model: J={j_new:.4f}")
+        timings["logical_polish_cpu"] = perf_counter() - logical_started
+
+        self.coef_ = np.asarray(w_final, dtype=np.float64).reshape(1, -1)
+        self.intercept_ = np.array([b_final], dtype=np.float64)
+        cuda_backend.synchronize()
+        _emit_progress(
+            progress_callback,
+            phase="final_refit",
+            completed=1,
+            total=1,
+            backend="cuda",
+            started_at=fit_started,
+        )
+        return {
+            "timings": timings,
+            "transfer_bytes": int(transfer_bytes),
+            "synchronization_count": int(cuda_backend.synchronization_count),
+        }
+
+
+    def fit(
+        self,
+        X,
+        y,
+        *,
+        progress_callback: Optional[Callable[[dict[str, Any]], None]] = None,
+        cancel_callback: Optional[Callable[[], bool]] = None,
+    ):
+        """Fit using the requested CPU, CUDA, or automatically selected backend."""
+
+        fit_started = perf_counter()
+        requested = normalise_backend(self.backend)
+        dtype_name = normalise_dtype(self.dtype)
+        device_id = normalise_device(self.device)
+        self.backend_requested_ = requested
+        self.backend_used_ = None
+        self.backend_provider_ = None
+        self.device_id_ = None
+        self.device_name_ = None
+        self.dtype_ = dtype_name
+        self.n_jobs_effective_ = None
+        self.fallback_reason_ = None
+        self.auto_decision_ = None
+        self.fit_timings_ = {}
+        self.peak_device_memory_bytes_ = None
+        self.runtime_versions_ = {}
+        self.backend_report_ = {}
+        self.Cs_ = None
+        self.C_ = None
+        self.coef_ = None
+        self.intercept_ = None
+        self.cv_fold_losses_ = None
+        self.cv_mean_losses_ = None
+        self.cv_se_losses_ = None
+        self.cv_path_Cs_ = None
+        self.logic_diag_ = {}
+        self.logic_figs_ = []
+        self.adaptive_feature_scales_ = None
+        self.adaptive_penalty_weights_ = None
+        self.adaptive_pilot_coef_ = None
+        self.adaptive_pilot_intercept_ = None
+        self.adaptive_weighted_coef_ = None
+        callback_failures: list[Exception] = []
+
+        if progress_callback is not None:
+            user_progress_callback = progress_callback
+
+            def progress_proxy(event: dict[str, Any]) -> None:
+                try:
+                    user_progress_callback(event)
+                except Exception as exc:
+                    callback_failures.append(exc)
+                    raise
+
+            progress_callback = progress_proxy
+
+        if cancel_callback is not None:
+            user_cancel_callback = cancel_callback
+
+            def cancel_proxy() -> bool:
+                try:
+                    return bool(user_cancel_callback())
+                except Exception as exc:
+                    callback_failures.append(exc)
+                    raise
+
+            cancel_callback = cancel_proxy
+
+        _check_cancel(cancel_callback)
+
+        shape = np.shape(X)
+        if len(shape) != 2:
+            raise ValueError("X must be a 2D array.")
+        rows, features = map(int, shape)
+        work = estimate_work(
+            rows,
+            features,
+            self.cv,
+            self._c_count(),
+            self.penalty,
+        )
+        required_bytes = estimate_cuda_bytes(
+            rows, features, self.cv, self.penalty
+        )
+        auto_decision: Optional[dict[str, Any]] = None
+        try:
+            auto_threshold = max(
+                1, int(os.environ.get("CUTLASS_CUDA_AUTO_MIN_WORK", "75000000"))
+            )
+        except ValueError:
+            auto_threshold = 75_000_000
+
+        if requested == "cpu":
+            return self._run_cpu_backend(
+                X,
+                y,
+                requested=requested,
+                dtype_name=dtype_name,
+                fit_started=fit_started,
+                fallback_reason=None,
+                auto_decision=None,
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+            )
+
+        supported, capability_code = cuda_supports(self.solver, dtype_name)
+        if not supported:
+            message = (
+                f"CUDA does not support solver='{self.solver}' with dtype='{dtype_name}'."
+            )
+            if requested == "auto":
+                auto_decision = {
+                    "selected": "cpu",
+                    "reason": capability_code,
+                    "estimated_work": int(work),
+                    "estimated_device_bytes": int(required_bytes),
+                }
+                return self._run_cpu_backend(
+                    X,
+                    y,
+                    requested=requested,
+                    dtype_name=dtype_name,
+                    fit_started=fit_started,
+                    fallback_reason=None,
+                    auto_decision=auto_decision,
+                    progress_callback=progress_callback,
+                    cancel_callback=cancel_callback,
+                )
+            if not self.allow_cpu_fallback:
+                raise BackendConfigurationError(message)
+            fallback = {
+                "code": capability_code,
+                "phase": "backend_resolution",
+                "message": message,
+            }
+            warnings.warn(message + " Falling back to CPU.", CutlassBackendWarning, stacklevel=2)
+            return self._run_cpu_backend(
+                X,
+                y,
+                requested=requested,
+                dtype_name=dtype_name,
+                fit_started=fit_started,
+                fallback_reason=fallback,
+                auto_decision=None,
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+            )
+
+        if requested == "auto" and work < auto_threshold:
+            auto_decision = {
+                "selected": "cpu",
+                "reason": "below_crossover",
+                "estimated_work": int(work),
+                "threshold": int(auto_threshold),
+                "estimated_device_bytes": int(required_bytes),
+                "policy_version": 1,
+            }
+            return self._run_cpu_backend(
+                X,
+                y,
+                requested=requested,
+                dtype_name=dtype_name,
+                fit_started=fit_started,
+                fallback_reason=None,
+                auto_decision=auto_decision,
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+            )
+
+        try:
+            from ._cuda_backend import CudaBackend
+
+            cuda_backend = CudaBackend(device=device_id)
+        except Exception as exc:
+            if isinstance(exc, FitCancelledError):
+                raise
+            message = f"CUDA backend is unavailable ({type(exc).__name__})."
+            if requested == "auto":
+                auto_decision = {
+                    "selected": "cpu",
+                    "reason": "cuda_unavailable",
+                    "estimated_work": int(work),
+                    "estimated_device_bytes": int(required_bytes),
+                }
+                return self._run_cpu_backend(
+                    X,
+                    y,
+                    requested=requested,
+                    dtype_name=dtype_name,
+                    fit_started=fit_started,
+                    fallback_reason=None,
+                    auto_decision=auto_decision,
+                    progress_callback=progress_callback,
+                    cancel_callback=cancel_callback,
+                )
+            if not self.allow_cpu_fallback:
+                if isinstance(exc, BackendUnavailableError):
+                    raise
+                raise BackendUnavailableError(message) from exc
+            fallback = {
+                "code": "cuda_unavailable",
+                "phase": "backend_resolution",
+                "message": message,
+            }
+            warnings.warn(message + " Falling back to CPU.", CutlassBackendWarning, stacklevel=2)
+            return self._run_cpu_backend(
+                X,
+                y,
+                requested=requested,
+                dtype_name=dtype_name,
+                fit_started=fit_started,
+                fallback_reason=fallback,
+                auto_decision=None,
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+            )
+
+        memory = cuda_backend.memory_info()
+        memory_safe = required_bytes <= int(memory["free_bytes"] * 0.8)
+
+        if requested == "auto":
+            if not memory_safe:
+                auto_decision = {
+                    "selected": "cpu",
+                    "reason": "memory_preflight",
+                    "estimated_work": int(work),
+                    "threshold": int(auto_threshold),
+                    "estimated_device_bytes": int(required_bytes),
+                    "free_device_bytes": int(memory["free_bytes"]),
+                    "policy_version": 1,
+                }
+                return self._run_cpu_backend(
+                    X,
+                    y,
+                    requested=requested,
+                    dtype_name=dtype_name,
+                    fit_started=fit_started,
+                    fallback_reason=None,
+                    auto_decision=auto_decision,
+                    progress_callback=progress_callback,
+                    cancel_callback=cancel_callback,
+                )
+            auto_decision = {
+                "selected": "cuda",
+                "reason": "supported_workload",
+                "estimated_work": int(work),
+                "threshold": int(auto_threshold),
+                "estimated_device_bytes": int(required_bytes),
+                "free_device_bytes": int(memory["free_bytes"]),
+                "policy_version": 1,
+            }
+        elif not memory_safe:
+            message = "CUDA memory preflight rejected the fit."
+            if not self.allow_cpu_fallback:
+                raise BackendExecutionError(message)
+            fallback = {
+                "code": "memory_preflight",
+                "phase": "backend_resolution",
+                "message": message,
+            }
+            warnings.warn(message + " Falling back to CPU.", CutlassBackendWarning, stacklevel=2)
+            return self._run_cpu_backend(
+                X,
+                y,
+                requested=requested,
+                dtype_name=dtype_name,
+                fit_started=fit_started,
+                fallback_reason=fallback,
+                auto_decision=None,
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+            )
+
+        try:
+            with cuda_backend.device:
+                details = self._fit_cuda(
+                    X,
+                    y,
+                    cuda_backend=cuda_backend,
+                    progress_callback=progress_callback,
+                    cancel_callback=cancel_callback,
+                    fit_started=fit_started,
+                )
+        except FitCancelledError:
+            raise
+        except Exception as exc:
+            if callback_failures and exc is callback_failures[-1]:
+                raise
+            out_of_memory = cuda_backend.is_out_of_memory(exc)
+            code = "cuda_out_of_memory" if out_of_memory else "cuda_execution_failed"
+            if out_of_memory:
+                cuda_backend.clear_unused()
+            message = f"CUDA fit failed during execution ({type(exc).__name__})."
+            if not self.allow_cpu_fallback:
+                raise BackendExecutionError(message) from exc
+            fallback = {
+                "code": code,
+                "phase": "cuda_fit",
+                "message": message,
+                "process_restart_recommended": not out_of_memory,
+            }
+            warnings.warn(message + " Falling back to CPU.", CutlassBackendWarning, stacklevel=2)
+            try:
+                X_cpu = cuda_backend.to_numpy(X) if cuda_backend.is_device_array(X) else X
+                y_cpu = cuda_backend.to_numpy(y) if cuda_backend.is_device_array(y) else y
+            except Exception as transfer_exc:
+                raise BackendExecutionError(
+                    "CUDA failed and device input could not be recovered for CPU fallback."
+                ) from transfer_exc
+            return self._run_cpu_backend(
+                X_cpu,
+                y_cpu,
+                requested=requested,
+                dtype_name=dtype_name,
+                fit_started=fit_started,
+                fallback_reason=fallback,
+                auto_decision=auto_decision,
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+            )
+
+        total_elapsed = perf_counter() - fit_started
+        timings = dict(details["timings"])
+        timings["total"] = float(total_elapsed)
+        self.backend_requested_ = requested
+        self.backend_used_ = "cuda"
+        self.backend_provider_ = "cupy"
+        self.device_id_ = int(cuda_backend.device_id)
+        self.device_name_ = cuda_backend.device_name
+        self.dtype_ = dtype_name
+        self.n_jobs_effective_ = 1
+        self.fallback_reason_ = None
+        self.auto_decision_ = auto_decision
+        self.fit_timings_ = timings
+        self.peak_device_memory_bytes_ = int(cuda_backend.peak_used_bytes)
+        self.runtime_versions_ = cuda_backend.versions
+        self.backend_report_ = {
+            "requested": requested,
+            "used": "cuda",
+            "provider": "cupy",
+            "decision": auto_decision,
+            "fallback": None,
+            "device": {
+                "id": int(cuda_backend.device_id),
+                "name": cuda_backend.device_name,
+                "compute_capability": cuda_backend.status.compute_capability,
+            },
+            "dtype": dtype_name,
+            "shape": {"rows": rows, "features": features},
+            "cv": int(self.cv),
+            "c_values": self._c_count(),
+            "solver": str(self.solver).lower(),
+            "penalty": str(self.penalty).lower(),
+            "n_jobs_effective": 1,
+            "transfer_bytes": int(details["transfer_bytes"]),
+            "synchronization_count": int(details["synchronization_count"]),
+            "timings_seconds": dict(timings),
+            "peak_device_memory_bytes": int(cuda_backend.peak_used_bytes),
+            "peak_reserved_device_memory_bytes": int(cuda_backend.peak_reserved_bytes),
+            "runtime_versions": dict(self.runtime_versions_),
+        }
+        _emit_progress(
+            progress_callback,
+            phase="complete",
+            completed=1,
+            total=1,
+            backend="cuda",
+            started_at=fit_started,
+        )
+        return self
 
 
     def predict_proba(self, X):
